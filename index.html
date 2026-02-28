@@ -260,7 +260,10 @@ function App() {
     return () => listenersRef.current.forEach(off => off());
   }, []);
 
-  // ---- HUMAN MATCHING via Firebase ----
+  // ---- HUMAN MATCHING via Firebase (Batch mode) ----
+  // Students submit, wait for matching window, then get randomly paired
+  const [countdown, setCountdown] = useState(0);
+
   const submitHuman = async (myChoice) => {
     if (!firebaseReady) {
       alert("Firebase 未配置！请按照说明设置 Firebase。\nFirebase not configured! Follow setup instructions.");
@@ -269,90 +272,118 @@ function App() {
     setChoice(myChoice);
     setWaiting(true);
 
+    // Submit to pending pool
     const myRef = db.ref(`games/${gameId}/pending/${myId.current}`);
     await myRef.set({
       name: name || "匿名",
       studentId: studentId || "",
-      sessionCode: sessionCode || "",
-      section: section || "",
       choice: myChoice,
       timestamp: firebase.database.ServerValue.TIMESTAMP,
     });
 
-    // Listen for match result
-    const matchRef = db.ref(`games/${gameId}/matches/${myId.current}`);
-    const onMatch = matchRef.on("value", (snap) => {
-      const match = snap.val();
-      if (!match) return;
-      matchRef.off("value", onMatch);
-      const key = `${myChoice},${match.opponentChoice}`;
-      const po = game.payoffs[key];
-      const res = {
-        myChoice, oppChoice: match.opponentChoice,
-        oppName: match.opponentName,
-        label: po.label, myPay: po.p1, oppPay: po.p2,
-        key,
-      };
-      setResult(res);
-      setWaiting(false);
-      setScreen("result");
+    // Start countdown (30 seconds)
+    let timeLeft = 30;
+    setCountdown(timeLeft);
+    const timer = setInterval(() => {
+      timeLeft--;
+      setCountdown(timeLeft);
+      if (timeLeft <= 0) clearInterval(timer);
+    }, 1000);
 
-      // Record to results log
-      db.ref(`games/${gameId}/results`).push({
-        player: name || "匿名", studentId: studentId || "", section: section || "", sessionCode: sessionCode || "",
-        choice: myChoice,
-        opponent: match.opponentName, oppChoice: match.opponentChoice,
-        payoff: po.p1, timestamp: firebase.database.ServerValue.TIMESTAMP,
+    // Only start listening for match AFTER 30 seconds
+    // This ensures everyone waits the full countdown
+    setTimeout(() => {
+      const matchRef = db.ref(`games/${gameId}/matches/${myId.current}`);
+      const onMatch = matchRef.on("value", (snap) => {
+        const match = snap.val();
+        if (!match) return;
+        matchRef.off("value", onMatch);
+        const key = `${myChoice},${match.opponentChoice}`;
+        const po = game.payoffs[key];
+        const res = {
+          myChoice, oppChoice: match.opponentChoice,
+          oppName: match.opponentName,
+          label: po.label, myPay: po.p1, oppPay: po.p2, key,
+        };
+        setResult(res);
+        setWaiting(false);
+        setCountdown(0);
+        setScreen("result");
+
+        // Record to results log
+        db.ref(`games/${gameId}/results`).push({
+          player: name || "匿名", studentId: studentId || "",
+          choice: myChoice,
+          opponent: match.opponentName, oppChoice: match.opponentChoice,
+          payoff: po.p1, timestamp: firebase.database.ServerValue.TIMESTAMP,
+        });
       });
-    });
-    listenersRef.current.push(() => matchRef.off("value", onMatch));
+      listenersRef.current.push(() => matchRef.off("value", onMatch));
+    }, 30000);
 
-    // Try to find a match
-    const pendingRef = db.ref(`games/${gameId}/pending`);
-    const onPending = pendingRef.on("value", async (snap) => {
+    // After 30 seconds, try to match everyone
+    setTimeout(async () => {
+      // Check if already matched
+      const myMatchSnap = await db.ref(`games/${gameId}/matches/${myId.current}`).once("value");
+      if (myMatchSnap.val()) return; // Already matched
+
+      // Read all pending submissions
+      const snap = await db.ref(`games/${gameId}/pending`).once("value");
       const pending = snap.val();
-      if (!pending) return;
+      if (!pending) {
+        matchRef.off("value", onMatch);
+        setWaiting(false);
+        setCountdown(0);
+        alert("没有其他人提交，请稍后重试。\nNo other submissions. Please try again.");
+        setScreen("play");
+        setChoice(null);
+        return;
+      }
 
+      // Get all other players
       const others = Object.entries(pending).filter(([id]) => id !== myId.current);
-      if (others.length === 0) return;
 
-      // Pick first available opponent
-      const [oppId, oppData] = others[0];
+      if (others.length === 0) {
+        matchRef.off("value", onMatch);
+        myRef.remove();
+        setWaiting(false);
+        setCountdown(0);
+        alert("没有找到对手，请等其他同学也提交后重试。\nNo opponent found. Wait for classmates to submit and try again.");
+        setScreen("play");
+        setChoice(null);
+        return;
+      }
 
-      // Atomic match: try to remove both pending entries
+      // Pick a random opponent (with replacement — don't remove them from pending)
+      // This way odd-numbered students still get matched
+      const randomIdx = Math.floor(Math.random() * others.length);
+      const [oppId, oppData] = others[randomIdx];
+
+      // Create match — only remove SELF from pending, not opponent
+      // Opponent stays available for other unmatched students
       const updates = {};
       updates[`games/${gameId}/pending/${myId.current}`] = null;
-      updates[`games/${gameId}/pending/${oppId}`] = null;
       updates[`games/${gameId}/matches/${myId.current}`] = {
         opponentChoice: oppData.choice,
         opponentName: oppData.name,
       };
-      updates[`games/${gameId}/matches/${oppId}`] = {
-        opponentChoice: myChoice,
-        opponentName: name || "匿名",
-      };
+
+      // Also try to match the opponent with us (if they haven't been matched yet)
+      const oppMatchSnap = await db.ref(`games/${gameId}/matches/${oppId}`).once("value");
+      if (!oppMatchSnap.val()) {
+        updates[`games/${gameId}/pending/${oppId}`] = null;
+        updates[`games/${gameId}/matches/${oppId}`] = {
+          opponentChoice: myChoice,
+          opponentName: name || "匿名",
+        };
+      }
 
       try {
         await db.ref().update(updates);
-        pendingRef.off("value", onPending);
       } catch (e) {
-        // Another client may have matched first, keep waiting
+        console.log("Match conflict, retrying...");
       }
-    });
-    listenersRef.current.push(() => pendingRef.off("value", onPending));
-
-    // Timeout after 60s
-    setTimeout(() => {
-      if (waiting) {
-        myRef.remove();
-        pendingRef.off("value", onPending);
-        matchRef.off("value", onMatch);
-        setWaiting(false);
-        alert("配对超时，请重试。 Matching timed out, please try again.");
-        setScreen("play");
-        setChoice(null);
-      }
-    }, 60000);
+    }, 30000);
   };
 
   // ---- AI PLAY ----
@@ -460,23 +491,15 @@ function App() {
           onBlur={e => e.target.style.borderColor = `${C.HEADER}40`}
         />
 
-        <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+        <div style={{ marginBottom: 12 }}>
           <button className="btn-press" onClick={() => {
             if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
             setMode("human"); setScreen("intro");
           }}
-            style={{ flex: 1, padding: "18px 12px", fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
+            style={{ width: "100%", padding: "18px 12px", fontSize: 15, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
             disabled={!firebaseReady}>
-            <div style={{ fontSize: 22, marginBottom: 2 }}>👥</div>
-            对战真人<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>vs Human</span>
-          </button>
-          <button className="btn-press" onClick={() => {
-            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
-            setMode("ai"); setScreen("intro");
-          }}
-            style={{ flex: 1, padding: "18px 12px", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg, #2D1B4E, #1B1040)", border: "1px solid #4A3070", borderRadius: 12, color: "white", cursor: "pointer", boxShadow: "0 4px 20px #2D1B4E50" }}>
-            <div style={{ fontSize: 22, marginBottom: 2 }}>🤖</div>
-            对战AI<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>vs AI Agent</span>
+            <div style={{ fontSize: 22, marginBottom: 2 }}>🎮</div>
+            开始游戏 Start Game
           </button>
         </div>
 
@@ -504,7 +527,7 @@ function App() {
     return (
       <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG} 0%, #0F1A30 100%)`, overflowY: "auto" }}>
         <button className="btn-press" onClick={() => setScreen("home")}
-          style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", zIndex: 10 }}>← 返回</button>
+          style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", zIndex: 10 }}>← Back 返回</button>
 
         <div style={{ maxWidth: 420, width: "100%", paddingTop: 30 }}>
           {/* Header */}
@@ -517,7 +540,7 @@ function App() {
 
           {/* Story */}
           <div className="fade-up fade-up-1" style={{ background: C.SURFACE, borderRadius: 14, padding: 16, border: `1px solid ${C.HEADER}25`, marginBottom: 14 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>📖 故事背景</div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>📖 故事背景 Story</div>
             <p style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.7, marginBottom: 8 }}>{intro.story}</p>
             <p style={{ fontSize: 11, color: C.DIM, lineHeight: 1.5, fontStyle: "italic" }}>{intro.storySub}</p>
           </div>
@@ -577,9 +600,9 @@ function App() {
 
         {!waiting ? (
           <div className="fade-up">
-            <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>选择你的策略</h2>
+            <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>选择你的策略 Make Your Choice</h2>
             <p style={{ fontSize: 12, color: C.TEXT2, marginBottom: 6 }}>
-              {mode === "ai" ? "对战 Claude AI" : "对战真人 · 随机匿名配对"}
+              {mode === "ai" ? "对战 Claude AI" : "对战真人 Random anonymous matching"}
             </p>
             <p style={{ fontSize: 12, color: C.DIM, marginBottom: 20 }}>{game.descCN}</p>
 
@@ -587,7 +610,7 @@ function App() {
             <div style={{ marginBottom: 20 }}>
               <button className="btn-press" onClick={() => setShowMatrix(!showMatrix)}
                 style={{ fontSize: 11, color: C.DIM, background: "none", border: `1px solid ${C.DIM}25`, borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}>
-                {showMatrix ? "▲ 隐藏矩阵" : "▼ 查看收益矩阵"}
+                {showMatrix ? "▲ 隐藏 Hide" : "▼ 收益矩阵 Payoff Matrix"}
               </button>
               {showMatrix && (
                 <div style={{ marginTop: 10, background: C.SURFACE, borderRadius: 10, padding: 12, border: `1px solid ${C.HEADER}25` }}>
@@ -606,7 +629,7 @@ function App() {
                       </tr>
                     ))}
                   </table>
-                  <p style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>格式：你的成绩, 对方成绩</p>
+                  <p style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>Format: your grade, their grade</p>
                 </div>
               )}
             </div>
@@ -634,15 +657,32 @@ function App() {
           </div>
         ) : (
           <div className="fade-up" style={{ padding: 40 }}>
-            <div style={{ width: 44, height: 44, margin: "0 auto 14px", border: `3px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+            {/* Countdown circle */}
+            <div style={{ position: "relative", width: 80, height: 80, margin: "0 auto 16px" }}>
+              <svg width="80" height="80" style={{ transform: "rotate(-90deg)" }}>
+                <circle cx="40" cy="40" r="34" fill="none" stroke={`${C.DIM}25`} strokeWidth="4" />
+                <circle cx="40" cy="40" r="34" fill="none" stroke={C.GOLD} strokeWidth="4"
+                  strokeDasharray={`${2 * Math.PI * 34}`}
+                  strokeDashoffset={`${2 * Math.PI * 34 * (1 - countdown / 30)}`}
+                  strokeLinecap="round"
+                  style={{ transition: "stroke-dashoffset 1s linear" }} />
+              </svg>
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 800, color: C.GOLD }}>
+                {countdown}
+              </div>
+            </div>
+
             <h2 style={{ fontSize: 18, color: C.TEXT, marginBottom: 6 }}>
-              {mode === "ai" ? `AI 思考中${waitDots}` : `等待配对${waitDots}`}
+              等待同学们提交... Waiting for classmates...
             </h2>
             <p style={{ fontSize: 12, color: C.DIM }}>
-              {mode === "ai" ? "正在计算最优策略..." : "等待其他同学提交选择..."}
+              {countdown > 0 ? `${countdown} 秒后随机配对 / Matching in ${countdown}s` : "Matching now... 正在配对中..."}
             </p>
             <p style={{ fontSize: 14, color: C.TEXT2, marginTop: 12 }}>
               你选择了 <strong style={{ color: choice === "α" ? C.ALPHA_C : C.BETA_C, fontSize: 18 }}>{choice}</strong>
+            </p>
+            <p style={{ fontSize: 11, color: C.DIM, marginTop: 8 }}>
+              ✓ 已提交 Submitted — 请等待 Please wait
             </p>
           </div>
         )}
@@ -704,7 +744,7 @@ function App() {
             <div className="fade-up fade-up-3" style={{ background: "linear-gradient(135deg, #1A1035, #1F1540)", border: "1px solid #4A307040", borderRadius: 12, padding: 14, marginBottom: 14, textAlign: "left" }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ display: "inline-flex", width: 20, height: 20, borderRadius: 5, background: "linear-gradient(135deg, #D4A84B, #C00000)", alignItems: "center", justifyContent: "center", fontSize: 10 }}>🤖</span>
-                Claude AI 的思考过程
+                Claude AI 的思考过程 Claude's Reasoning
               </div>
               <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7, marginBottom: 8 }}>
                 {result.aiReasoningCN}
@@ -718,7 +758,7 @@ function App() {
           {/* AI history */}
           {mode === "ai" && aiHistory.length > 1 && (
             <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>对战记录 ({aiHistory.length} 局)</div>
+              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>对战记录 History ({aiHistory.length} 局 rounds)</div>
               <div style={{ display: "flex", gap: 3, justifyContent: "center", flexWrap: "wrap" }}>
                 {aiHistory.map((h, i) => (
                   <div key={i} style={{
@@ -733,8 +773,8 @@ function App() {
           )}
 
           <div style={{ display: "flex", gap: 10 }}>
-            <Btn primary onClick={playAgain}>再来一局</Btn>
-            <Btn onClick={() => { setChoice(null); setResult(null); setScreen("home"); }}>返回首页</Btn>
+            <Btn primary onClick={playAgain}>再来一局 Play Again</Btn>
+            <Btn onClick={() => { setChoice(null); setResult(null); setScreen("home"); }}>返回首页 Home</Btn>
           </div>
         </div>
       </div>
@@ -752,25 +792,25 @@ function App() {
         <div style={{ maxWidth: 460, margin: "0 auto" }}>
           <button className="btn-press" onClick={() => setScreen("home")} style={{ background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", marginBottom: 14 }}>← 返回</button>
 
-          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 2 }}>🎓 教师面板</h2>
-          <p style={{ fontSize: 12, color: C.TEXT2, marginBottom: 20 }}>{game.nameCN} · 实时课堂统计</p>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 2 }}>🎓 教师面板 Teacher Panel</h2>
+          <p style={{ fontSize: 12, color: C.TEXT2, marginBottom: 20 }}>{game.nameCN} · 实时课堂统计 Live Stats</p>
 
           <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
             <Box style={{ flex: 1, textAlign: "center" }}>
               <div style={{ fontSize: 32, fontWeight: 800, color: C.ALPHA_C }}>{aR}%</div>
-              <div style={{ fontSize: 12, color: C.TEXT2 }}>选择 α</div>
+              <div style={{ fontSize: 12, color: C.TEXT2 }}>Chose α 选择 α</div>
               <div style={{ fontSize: 10, color: C.DIM }}>{stats.alpha}/{total} 人</div>
             </Box>
             <Box style={{ flex: 1, textAlign: "center" }}>
               <div style={{ fontSize: 32, fontWeight: 800, color: C.BETA_C }}>{bR}%</div>
-              <div style={{ fontSize: 12, color: C.TEXT2 }}>选择 β</div>
+              <div style={{ fontSize: 12, color: C.TEXT2 }}>Chose β 选择 β</div>
               <div style={{ fontSize: 10, color: C.DIM }}>{stats.beta}/{total} 人</div>
             </Box>
           </div>
 
           {/* Bar */}
           <Box style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>策略分布</div>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>策略分布 Distribution</div>
             <div style={{ display: "flex", height: 28, borderRadius: 8, overflow: "hidden", background: `${C.DIM}20` }}>
               <div style={{ width: `${aR}%`, background: `linear-gradient(90deg, #3A7BD5, ${C.ALPHA_C})`, transition: "width 0.6s ease", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "white" }}>
                 {aR > 12 ? `α ${aR}%` : ""}
@@ -783,22 +823,22 @@ function App() {
 
           {/* Polak comparison */}
           <Box style={{ background: `${C.GOLD}08`, border: `1px solid ${C.GOLD}20`, marginBottom: 16 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>📖 对比 Polak (Yale 2007)</div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>📖 对比 Polak (Yale 2007) Comparison</div>
             <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
-              耶鲁课堂：~85% 选 α, ~15% 选 β<br/>
-              普通人实验：~70% 选 α, ~30% 选 β<br/><br/>
-              <strong style={{ color: C.TEXT }}>你的课堂：{aR}% α, {bR}% β ({total}人)</strong><br/>
-              {total === 0 ? "还没有数据——让学生开始游戏吧！" :
-               aR > 75 ? "你的学生和耶鲁学生一样「理性」（自私？😄）" :
-               bR > 50 ? "你的学生更倾向合作——是天使还是还没学到占优策略？" :
-               "有趣的分布！课堂讨论的好素材。"}
+              耶鲁课堂 Yale: ~85% chose α, ~15% chose β<br/>
+              普通人实验 General public: ~70% chose α, ~30% chose β<br/><br/>
+              <strong style={{ color: C.TEXT }}>你的课堂 Your class: {aR}% α, {bR}% β ({total} students)</strong><br/>
+              {total === 0 ? "还没有数据 No data yet — start the game!" :
+               aR > 75 ? "和耶鲁学生差不多！Similar to Yale — most chose the dominant strategy (under selfish preferences)" :
+               bR > 50 ? "你的学生更倾向合作 Your students prefer cooperation — interesting! Why?" :
+               "有趣的分布！Interesting — great for class discussion."}
             </div>
           </Box>
 
           {/* Recent results */}
           {stats.results.length > 0 && (
             <Box>
-              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>最近结果（含学号和验证码）</div>
+              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>最近结果 Recent Results（含学号和验证码）</div>
               {stats.results.slice(0, 20).map((r, i) => (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: i < 19 ? `1px solid ${C.DIM}15` : "none", fontSize: 12 }}>
                   <div style={{ flex: 1 }}>
@@ -820,10 +860,23 @@ function App() {
             </Box>
           )}
 
-          <button className="btn-press" onClick={loadStats}
-            style={{ width: "100%", marginTop: 12, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
-            🔄 刷新数据
-          </button>
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button className="btn-press" onClick={loadStats}
+              style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
+              🔄 刷新 Refresh
+            </button>
+            <button className="btn-press" onClick={async () => {
+              if (!firebaseReady) return;
+              const pw = prompt("确认清除所有数据？输入 reset 确认\nClear all data? Type 'reset' to confirm:");
+              if (pw !== "reset") return;
+              await db.ref(`games/${gameId}`).remove();
+              setStats({ alpha: 0, beta: 0, results: [] });
+              alert("✅ 数据已清除 / All data cleared");
+            }}
+              style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>
+              🗑️ 清除 Reset All
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -834,9 +887,9 @@ function App() {
     <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #0F1A30)` }}>
       <div style={{ maxWidth: 460, margin: "0 auto" }}>
         <button className="btn-press" onClick={() => setScreen("home")} style={{ background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", marginBottom: 14 }}>← 返回</button>
-        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 16 }}>📊 历史记录</h2>
+        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 16 }}>📊 历史记录 History</h2>
         {stats.results.length === 0 ? (
-          <p style={{ color: C.DIM, fontSize: 13 }}>还没有记录。去玩一局吧！</p>
+          <p style={{ color: C.DIM, fontSize: 13 }}>还没有记录。去玩一局吧！No records yet — go play!</p>
         ) : stats.results.map((r, i) => (
           <Box key={i} style={{ marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div>
