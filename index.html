@@ -95,12 +95,36 @@ const C = {
 // ================================================================
 // GAME DEFINITIONS
 // ================================================================
+// ┌─────────────────────────────────────────────────────────┐
+// │  TO ADD A NEW GAME EACH WEEK:                           │
+// │  1. Copy the grade_game template below                  │
+// │  2. Change the id, name, strategies, payoffs, etc.      │
+// │  3. Save and re-upload to GitHub                        │
+// │  That's it! The app auto-detects all games in GAMES.    │
+// └─────────────────────────────────────────────────────────┘
 const GAMES = {
   grade_game: {
     id: "grade_game", name: "The Grade Game", nameCN: "成绩博弈", week: 1,
     desc: "Choose α or β. Your grade depends on both choices.",
     descCN: "选择 α 或 β。你的成绩取决于双方的选择。",
+    // ---- INTRO / STORY ----
+    intro: {
+      emoji: "📝",
+      story: "你正在参加一门课程的考试。教授有一个特别的评分规则：你的成绩不仅取决于你自己的选择，还取决于和你随机配对的另一个同学的选择。",
+      storySub: "You're in a course with a special grading rule: your grade depends on both YOUR choice and your randomly paired partner's choice.",
+      rules: [
+        { strats: "你选 α，对方选 α", outcome: "都拿 B−", icon: "😐", en: "Both choose α → Both get B−" },
+        { strats: "你选 α，对方选 β", outcome: "你拿 A，对方拿 C", icon: "😈", en: "You α, they β → You get A, they get C" },
+        { strats: "你选 β，对方选 α", outcome: "你拿 C，对方拿 A", icon: "😢", en: "You β, they α → You get C, they get A" },
+        { strats: "你选 β，对方选 β", outcome: "都拿 B+", icon: "🤝", en: "Both choose β → Both get B+" },
+      ],
+      question: "你会怎么选？信任陌生人，还是只顾自己？",
+      questionEN: "What will you choose? Trust a stranger, or look out for yourself?",
+      hint: "提示：想想看，无论对方怎么选，你选哪个总是更好？还是说...这取决于你在乎什么？",
+    },
     strategies: ["α", "β"],
+    stratLabels: { "α": "Alpha", "β": "Beta" },
+    stratColors: { "α": "#5BA8E0", "β": "#B08DE0" },
     payoffs: {
       "α,α": { label: "B−, B−", p1: 0, p2: 0 },
       "α,β": { label: "A, C",   p1: 3, p2: -1 },
@@ -113,22 +137,73 @@ const GAMES = {
       ["你 β", "C, A", "B+, B+"],
     ],
     lessons: {
-      "α,α": "你们都选了「自私」策略 α —— 理性选择导致了双输。这就是囚徒困境的核心：个体理性≠集体理性。",
-      "α,β": "你拿了A，对方拿了C。占优策略的诱惑就在这里——但如果对方在乎公平，这个博弈就完全不同了。",
-      "β,α": "你选了合作，但对方背叛了你。在没有惩罚机制的单次博弈中，合作者容易吃亏。",
-      "β,β": "恭喜！你们都选择了合作。但注意：α 是占优策略。你们是「愤怒的天使」还是没发现这一点？",
+      "α,α": "你们都选了 α —— 都拿了 B−。如果你们都只在乎自己的成绩，这就是经典的囚徒困境：α是占优策略，但双方的「理性」选择反而导致了双输。不过，如果你们在乎公平呢？那这可能是完全不同的博弈哦。\n\nYou both chose α — both got B−. If you only care about your own grade, this is a classic Prisoner's Dilemma: α dominates, but \"rational\" play leads to a lose-lose. But what if you care about fairness? Then it might be a completely different game.",
+      "α,β": "你拿了A，对方拿了C。从成绩角度看，你赢了🎉。但你会不会有一点点不好意思？如果你会——说明你的偏好不只是「成绩越高越好」，那这个博弈对你来说就完全不同了。\n\nYou got A, they got C. Grade-wise, you won 🎉. But do you feel a little guilty? If so — your preferences go beyond just \"higher grade = better\", and that changes the entire game for you.",
+      "β,α": "你选了β，对方选了α，你拿了C😅。但想想：你为什么选β？是信任对方会合作？还是你觉得B+对双方都好？你的选择暴露了你的偏好——而偏好决定了这是什么博弈。\n\nYou chose β, they chose α — you got C 😅. But think: why did you pick β? Did you trust them to cooperate? Or did you think B+ for both is the right outcome? Your choice reveals your preferences — and preferences determine what game you're actually playing.",
+      "β,β": "你们都选了β，都拿了B+ 🤝 不错！但想一想：如果你只在乎自己的成绩，选α本可以拿A。你没选，是因为你在乎公平？还是没注意到？不同的原因意味着不同的博弈。\n\nYou both chose β — both got B+ 🤝 Nice! But think: if you only cared about your own grade, α could have gotten you an A. You didn't pick it — is that because you care about fairness? Or did you not notice? Different reasons mean different games.",
     },
-    lessonTitle: "这是囚徒困境！ This is a Prisoner's Dilemma!",
+    lessonTitle: "关键问题：你在乎什么？What matters is: what do you care about?",
   },
 };
 
-// AI Strategies
-const AI = {
-  random: { name: "随机 Random", fn: () => Math.random() < 0.5 ? "α" : "β" },
-  selfish: { name: "自私鬼 Evil Git", fn: () => "α" },
-  cooperative: { name: "合作者 Cooperative", fn: () => "β" },
-  titfortat: { name: "以牙还牙 Tit-for-Tat", fn: (h) => h.length === 0 ? "β" : h[h.length-1].opp },
-};
+// AI — Claude via Anthropic API
+async function getClaudeChoice(game, history) {
+  try {
+    const historyStr = history.length > 0
+      ? "Previous rounds: " + history.map((h, i) => `Round ${i+1}: human=${h.mine}, AI=${h.opp}`).join("; ")
+      : "This is the first round.";
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{
+          role: "user",
+          content: `You are playing a game theory game called "${game.name}" against a human student.
+Available strategies: ${game.strategies.join(", ")}
+
+OUTCOME matrix (grades, NOT payoffs):
+  α,α → B−, B−
+  α,β → A, C  
+  β,α → C, A
+  β,β → B+, B+
+
+IMPORTANT: These are OUTCOMES (grades), not payoffs. The payoffs depend on PREFERENCES. 
+- If you are a "selfish" player (evil git) who only cares about your own grade: A=3, B+=1, B−=0, C=−1 → α is dominant.
+- If you are an "indignant angel" who feels guilt getting A while partner gets C, or anger getting C while partner gets A → the game changes completely, and there may be no dominant strategy.
+- The game theory lesson here is: the same outcomes + different preferences = completely different games.
+
+${historyStr}
+
+You must decide what kind of player you are and choose accordingly. Be creative — maybe you're selfish, maybe you care about fairness, maybe you're vengeful. Your personality can evolve across rounds.
+
+Respond in EXACTLY this JSON format, nothing else:
+{"choice":"α or β","reasoning_cn":"2-4句中文。先说明你的偏好/性格（你在乎什么），然后解释这如何影响你的策略选择。引用博弈论概念。","reasoning_en":"2-4 sentences in English. First state your preferences/personality, then explain how this affects your strategy. Reference game theory concepts."}`
+        }]
+      })
+    });
+    const data = await response.json();
+    const text = (data.content?.[0]?.text || "").trim();
+    try {
+      const clean = text.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(clean);
+      if (game.strategies.includes(parsed.choice)) {
+        return { choice: parsed.choice, reasoningCN: parsed.reasoning_cn, reasoningEN: parsed.reasoning_en };
+      }
+    } catch {}
+    // Fallback: try to find strategy in raw text
+    for (const s of game.strategies) {
+      if (text.includes(s)) return { choice: s, reasoningCN: "AI选择了策略 " + s, reasoningEN: "AI chose strategy " + s };
+    }
+    return { choice: game.strategies[0], reasoningCN: "（分析不可用）", reasoningEN: "(Analysis unavailable)" };
+  } catch (e) {
+    console.error("Claude API error:", e);
+    const fallback = game.strategies[Math.floor(Math.random() * game.strategies.length)];
+    return { choice: fallback, reasoningCN: "（API连接失败，随机选择）", reasoningEN: "(API connection failed, random choice)" };
+  }
+}
 
 // ================================================================
 // FIREBASE HELPERS
@@ -141,10 +216,15 @@ function generateId() {
 // APP COMPONENT
 // ================================================================
 function App() {
-  const [screen, setScreen] = useState("home");
+  const [screen, setScreen] = useState("home"); // home | intro | play | result | history | teacher
   const [name, setName] = useState(() => {
     try { return localStorage.getItem("gt_name") || ""; } catch { return ""; }
   });
+  const [studentId, setStudentId] = useState(() => {
+    try { return localStorage.getItem("gt_sid") || ""; } catch { return ""; }
+  });
+  const [sessionCode, setSessionCode] = useState("");
+  const [section, setSection] = useState("");
   const [mode, setMode] = useState("human");
   const [aiType, setAiType] = useState("random");
   const [waiting, setWaiting] = useState(false);
@@ -160,10 +240,13 @@ function App() {
   const myId = useRef(generateId());
   const listenersRef = useRef([]);
 
-  // Save name
+  // Save name & student ID
   useEffect(() => {
     try { if (name) localStorage.setItem("gt_name", name); } catch {}
   }, [name]);
+  useEffect(() => {
+    try { if (studentId) localStorage.setItem("gt_sid", studentId); } catch {}
+  }, [studentId]);
 
   // Waiting dots animation
   useEffect(() => {
@@ -189,6 +272,9 @@ function App() {
     const myRef = db.ref(`games/${gameId}/pending/${myId.current}`);
     await myRef.set({
       name: name || "匿名",
+      studentId: studentId || "",
+      sessionCode: sessionCode || "",
+      section: section || "",
       choice: myChoice,
       timestamp: firebase.database.ServerValue.TIMESTAMP,
     });
@@ -213,7 +299,8 @@ function App() {
 
       // Record to results log
       db.ref(`games/${gameId}/results`).push({
-        player: name || "匿名", choice: myChoice,
+        player: name || "匿名", studentId: studentId || "", section: section || "", sessionCode: sessionCode || "",
+        choice: myChoice,
         opponent: match.opponentName, oppChoice: match.opponentChoice,
         payoff: po.p1, timestamp: firebase.database.ServerValue.TIMESTAMP,
       });
@@ -269,23 +356,23 @@ function App() {
   };
 
   // ---- AI PLAY ----
-  const submitAI = (myChoice) => {
+  const submitAI = async (myChoice) => {
     setChoice(myChoice);
     setWaiting(true);
-    setTimeout(() => {
-      const aiChoice = AI[aiType].fn(aiHistory);
-      const key = `${myChoice},${aiChoice}`;
-      const po = game.payoffs[key];
-      const res = {
-        myChoice, oppChoice: aiChoice,
-        oppName: `AI (${AI[aiType].name})`,
-        label: po.label, myPay: po.p1, oppPay: po.p2, key,
-      };
-      setAiHistory(prev => [...prev, { mine: myChoice, opp: aiChoice }]);
-      setResult(res);
-      setWaiting(false);
-      setScreen("result");
-    }, 600 + Math.random() * 600);
+    const aiResult = await getClaudeChoice(game, aiHistory);
+    const key = `${myChoice},${aiResult.choice}`;
+    const po = game.payoffs[key];
+    const res = {
+      myChoice, oppChoice: aiResult.choice,
+      oppName: "Claude AI",
+      label: po.label, myPay: po.p1, oppPay: po.p2, key,
+      aiReasoningCN: aiResult.reasoningCN,
+      aiReasoningEN: aiResult.reasoningEN,
+    };
+    setAiHistory(prev => [...prev, { mine: myChoice, opp: aiResult.choice }]);
+    setResult(res);
+    setWaiting(false);
+    setScreen("result");
   };
 
   const handleChoice = (c) => {
@@ -352,7 +439,7 @@ function App() {
         <p style={{ fontSize: 13, color: C.GOLD, letterSpacing: "0.15em", textTransform: "uppercase", fontWeight: 600, margin: "4px 0 0" }}>
           ECON2501 · 博弈论实验室
         </p>
-        <p style={{ fontSize: 12, color: C.DIM, margin: "8px 0 28px" }}>上海交通大学</p>
+        <p style={{ fontSize: 12, color: C.DIM, margin: "8px 0 28px" }}></p>
 
         {!firebaseReady && (
           <div style={{ background: `${C.RED}15`, border: `1px solid ${C.RED}40`, borderRadius: 10, padding: 12, marginBottom: 16, fontSize: 12, color: "#FF8A80", textAlign: "left" }}>
@@ -362,19 +449,31 @@ function App() {
 
         <input type="text" placeholder="你的名字 / Your name" value={name}
           onChange={e => setName(e.target.value)}
+          style={{ width: "100%", padding: "13px 16px", fontSize: 15, background: C.SURFACE, border: `1px solid ${C.HEADER}40`, borderRadius: 11, color: C.TEXT, outline: "none", marginBottom: 10 }}
+          onFocus={e => e.target.style.borderColor = C.GOLD}
+          onBlur={e => e.target.style.borderColor = `${C.HEADER}40`}
+        />
+        <input type="text" placeholder="学号 / Student ID" value={studentId}
+          onChange={e => setStudentId(e.target.value)}
           style={{ width: "100%", padding: "13px 16px", fontSize: 15, background: C.SURFACE, border: `1px solid ${C.HEADER}40`, borderRadius: 11, color: C.TEXT, outline: "none", marginBottom: 16 }}
           onFocus={e => e.target.style.borderColor = C.GOLD}
           onBlur={e => e.target.style.borderColor = `${C.HEADER}40`}
         />
 
         <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
-          <button className="btn-press" onClick={() => { setMode("human"); setScreen("play"); }}
+          <button className="btn-press" onClick={() => {
+            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
+            setMode("human"); setScreen("intro");
+          }}
             style={{ flex: 1, padding: "18px 12px", fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
             disabled={!firebaseReady}>
             <div style={{ fontSize: 22, marginBottom: 2 }}>👥</div>
             对战真人<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>vs Human</span>
           </button>
-          <button className="btn-press" onClick={() => { setMode("ai"); setScreen("play"); }}
+          <button className="btn-press" onClick={() => {
+            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
+            setMode("ai"); setScreen("intro");
+          }}
             style={{ flex: 1, padding: "18px 12px", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg, #2D1B4E, #1B1040)", border: "1px solid #4A3070", borderRadius: 12, color: "white", cursor: "pointer", boxShadow: "0 4px 20px #2D1B4E50" }}>
             <div style={{ fontSize: 22, marginBottom: 2 }}>🤖</div>
             对战AI<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>vs AI Agent</span>
@@ -382,7 +481,11 @@ function App() {
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
-          <button className="btn-press" onClick={() => { loadStats(); setScreen("teacher"); }}
+          <button className="btn-press" onClick={() => {
+            const pw = prompt("请输入教师密码 / Enter teacher password:");
+            if (pw === "econ2501") { loadStats(); setScreen("teacher"); }
+            else if (pw !== null) alert("密码错误 / Wrong password");
+          }}
             style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}35`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
             🎓 教师面板
           </button>
@@ -394,6 +497,72 @@ function App() {
       </div>
     </div>
   );
+
+  // ---- INTRO (Game Description) ----
+  if (screen === "intro") {
+    const intro = game.intro;
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG} 0%, #0F1A30 100%)`, overflowY: "auto" }}>
+        <button className="btn-press" onClick={() => setScreen("home")}
+          style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", zIndex: 10 }}>← 返回</button>
+
+        <div style={{ maxWidth: 420, width: "100%", paddingTop: 30 }}>
+          {/* Header */}
+          <div className="fade-up" style={{ textAlign: "center", marginBottom: 20 }}>
+            <div style={{ fontSize: 48, marginBottom: 6 }}>{intro.emoji}</div>
+            <div style={{ fontSize: 11, color: C.GOLD, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>Week {game.week}</div>
+            <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 2 }}>{game.nameCN}</h2>
+            <p style={{ fontSize: 14, color: C.TEXT2 }}>{game.name}</p>
+          </div>
+
+          {/* Story */}
+          <div className="fade-up fade-up-1" style={{ background: C.SURFACE, borderRadius: 14, padding: 16, border: `1px solid ${C.HEADER}25`, marginBottom: 14 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>📖 故事背景</div>
+            <p style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.7, marginBottom: 8 }}>{intro.story}</p>
+            <p style={{ fontSize: 11, color: C.DIM, lineHeight: 1.5, fontStyle: "italic" }}>{intro.storySub}</p>
+          </div>
+
+          {/* Rules */}
+          <div className="fade-up fade-up-2" style={{ background: C.SURFACE, borderRadius: 14, padding: 16, border: `1px solid ${C.HEADER}25`, marginBottom: 14 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>📋 游戏规则 Game Rules</div>
+            {intro.rules.map((r, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: i < intro.rules.length - 1 ? `1px solid ${C.DIM}15` : "none" }}>
+                <div style={{ fontSize: 20, width: 32, textAlign: "center", flexShrink: 0 }}>{r.icon}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: C.TEXT2 }}>{r.strats}</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.TEXT }}>{r.outcome}</div>
+                  <div style={{ fontSize: 11, color: C.DIM }}>{r.en}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* AI info (if AI mode) */}
+          {mode === "ai" && (
+            <div className="fade-up fade-up-3" style={{ background: "linear-gradient(135deg, #1A1035, #2A1A40)", borderRadius: 14, padding: 16, border: `1px solid #4A307050`, marginBottom: 14, display: "flex", alignItems: "center", gap: 14 }}>
+              <div style={{ width: 48, height: 48, borderRadius: 12, background: "linear-gradient(135deg, #D4A84B, #C00000)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0 }}>🤖</div>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.PURPLE }}>Claude AI</div>
+                <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.5 }}>你的对手是AI。它会分析博弈结构和你的历史选择，做出策略性决定。<br/><span style={{ color: C.DIM }}>Your opponent is an AI that analyzes the game and your history.</span></div>
+              </div>
+            </div>
+          )}
+
+          {/* Start button */}
+          <button className="btn-press" onClick={() => setScreen("play")}
+            style={{
+              width: "100%", padding: "16px", fontSize: 16, fontWeight: 700,
+              background: mode === "ai" ? "linear-gradient(135deg, #2D1B4E, #4A3070)" : `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`,
+              border: "none", borderRadius: 12, color: "white", cursor: "pointer",
+              boxShadow: `0 4px 24px ${mode === "ai" ? "#2D1B4E" : C.BLUE}50`,
+              marginBottom: 30,
+            }}>
+            {mode === "ai" ? `⚔️ 开始对战 AI` : `👥 开始匹配对手`}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // ---- PLAY ----
   if (screen === "play") return (
@@ -410,23 +579,9 @@ function App() {
           <div className="fade-up">
             <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>选择你的策略</h2>
             <p style={{ fontSize: 12, color: C.TEXT2, marginBottom: 6 }}>
-              {mode === "ai" ? `对战 ${AI[aiType].name}` : "对战真人 · 随机匿名配对"}
+              {mode === "ai" ? "对战 Claude AI" : "对战真人 · 随机匿名配对"}
             </p>
             <p style={{ fontSize: 12, color: C.DIM, marginBottom: 20 }}>{game.descCN}</p>
-
-            {/* AI type selector */}
-            {mode === "ai" && (
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center", marginBottom: 20 }}>
-                {Object.entries(AI).map(([key, ai]) => (
-                  <button key={key} className="btn-press" onClick={() => setAiType(key)} style={{
-                    padding: "6px 12px", fontSize: 11, fontWeight: aiType === key ? 700 : 400,
-                    background: aiType === key ? `${C.GOLD}18` : "transparent",
-                    border: `1px solid ${aiType === key ? C.GOLD : C.DIM + "30"}`,
-                    borderRadius: 7, color: aiType === key ? C.GOLD : C.TEXT2, cursor: "pointer",
-                  }}>{ai.name}</button>
-                ))}
-              </div>
-            )}
 
             {/* Payoff matrix toggle */}
             <div style={{ marginBottom: 20 }}>
@@ -533,14 +688,32 @@ function App() {
           </div>
 
           {/* Lesson */}
-          <div className="fade-up fade-up-3" style={{ background: `${C.GOLD}0C`, border: `1px solid ${C.GOLD}25`, borderRadius: 12, padding: 14, marginBottom: 20, textAlign: "left" }}>
+          <div className="fade-up fade-up-3" style={{ background: `${C.GOLD}0C`, border: `1px solid ${C.GOLD}25`, borderRadius: 12, padding: 14, marginBottom: 14, textAlign: "left" }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 4 }}>
               💡 {game.lessonTitle}
             </div>
             <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.65 }}>
-              {game.lessons[result.key]}
+              {game.lessons[result.key].split("\n\n").map((para, i) => (
+                <p key={i} style={{ margin: i === 0 ? "0 0 8px" : "0", color: i === 0 ? C.TEXT2 : C.DIM, fontStyle: i === 0 ? "normal" : "italic" }}>{para}</p>
+              ))}
             </div>
           </div>
+
+          {/* Claude AI Reasoning */}
+          {result.aiReasoningCN && (
+            <div className="fade-up fade-up-3" style={{ background: "linear-gradient(135deg, #1A1035, #1F1540)", border: "1px solid #4A307040", borderRadius: 12, padding: 14, marginBottom: 14, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ display: "inline-flex", width: 20, height: 20, borderRadius: 5, background: "linear-gradient(135deg, #D4A84B, #C00000)", alignItems: "center", justifyContent: "center", fontSize: 10 }}>🤖</span>
+                Claude AI 的思考过程
+              </div>
+              <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7, marginBottom: 8 }}>
+                {result.aiReasoningCN}
+              </div>
+              <div style={{ fontSize: 11, color: C.DIM, lineHeight: 1.6, fontStyle: "italic", borderTop: `1px solid ${C.DIM}15`, paddingTop: 8 }}>
+                {result.aiReasoningEN}
+              </div>
+            </div>
+          )}
 
           {/* AI history */}
           {mode === "ai" && aiHistory.length > 1 && (
@@ -625,16 +798,21 @@ function App() {
           {/* Recent results */}
           {stats.results.length > 0 && (
             <Box>
-              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>最近结果</div>
-              {stats.results.slice(0, 15).map((r, i) => (
-                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < 14 ? `1px solid ${C.DIM}15` : "none", fontSize: 12 }}>
-                  <span style={{ color: C.TEXT }}>{r.player}</span>
-                  <span style={{ color: C.TEXT2 }}>
+              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>最近结果（含学号和验证码）</div>
+              {stats.results.slice(0, 20).map((r, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: i < 19 ? `1px solid ${C.DIM}15` : "none", fontSize: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <span style={{ color: C.TEXT, fontWeight: 600 }}>{r.player}</span>
+                    {r.studentId && <span style={{ color: C.DIM, fontSize: 10, marginLeft: 6 }}>{r.studentId}</span>}
+                    {r.section && <span style={{ color: C.ALPHA_C, fontSize: 9, marginLeft: 4, background: `${C.ALPHA_C}15`, padding: "1px 5px", borderRadius: 3 }}>{r.section}</span>}
+                    {r.sessionCode && <span style={{ color: C.GOLD, fontSize: 9, marginLeft: 4, background: `${C.GOLD}15`, padding: "1px 5px", borderRadius: 3 }}>{r.sessionCode}</span>}
+                  </div>
+                  <span style={{ color: C.TEXT2, marginRight: 8 }}>
                     <span style={{ color: r.choice === "α" ? C.ALPHA_C : C.BETA_C, fontWeight: 700 }}>{r.choice}</span>
                     {" vs "}
                     <span style={{ color: r.oppChoice === "α" ? C.ALPHA_C : C.BETA_C, fontWeight: 700 }}>{r.oppChoice}</span>
                   </span>
-                  <span style={{ color: r.payoff >= 0 ? C.GREEN : C.RED, fontWeight: 700 }}>
+                  <span style={{ color: r.payoff >= 0 ? C.GREEN : C.RED, fontWeight: 700, minWidth: 28, textAlign: "right" }}>
                     {r.payoff > 0 ? "+" : ""}{r.payoff}
                   </span>
                 </div>
