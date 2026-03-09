@@ -218,6 +218,9 @@ function generateId() {
 function App() {
   const [screen, setScreen] = useState("home"); // home | intro | play | result | history | teacher | beauty_intro | beauty_play | beauty_wait | beauty_result
   const [gameId, setGameId] = useState("grade_game");
+  const [beautyNumber, setBeautyNumber] = useState("");
+  const [beautyCountdown, setBeautyCountdown] = useState(0);
+  const [beautyResult, setBeautyResult] = useState(null);
   const [name, setName] = useState(() => {
     try { return localStorage.getItem("gt_name") || ""; } catch { return ""; }
   });
@@ -451,6 +454,52 @@ function App() {
       ...style,
     }} {...props}>{children}</button>
   );
+
+  // ================================================================
+  // P-BEAUTY CONTEST LOGIC
+  // ================================================================
+  const submitBeauty = async () => {
+    const num = parseInt(beautyNumber);
+    if (isNaN(num) || num < 0 || num > 100) { alert("请输入0-100的整数\nPlease enter an integer from 0 to 100"); return; }
+    if (!firebaseReady) return;
+
+    await db.ref("games/beauty_contest/submissions/" + myId.current).set({
+      name: name || "匿名", studentId: studentId || "", number: num,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+
+    setScreen("beauty_wait");
+
+    // Countdown
+    let t = 30;
+    setBeautyCountdown(t);
+    const timer = setInterval(() => { t--; setBeautyCountdown(t); if (t <= 0) clearInterval(timer); }, 1000);
+
+    // After 30s, compute results
+    setTimeout(async () => {
+      const snap = await db.ref("games/beauty_contest/submissions").once("value");
+      const subs = snap.val();
+      if (!subs) return;
+      const entries = Object.values(subs);
+      const numbers = entries.map(e => e.number);
+      const avg = numbers.reduce((a, b) => a + b, 0) / numbers.length;
+      const target = (2 / 3) * avg;
+      let closest = entries[0];
+      let minDist = Math.abs(entries[0].number - target);
+      entries.forEach(e => {
+        const dist = Math.abs(e.number - target);
+        if (dist < minDist) { minDist = dist; closest = e; }
+      });
+
+      setBeautyResult({
+        myNumber: num, avg: avg.toFixed(1), target: target.toFixed(1),
+        totalPlayers: entries.length, winner: closest.name, winnerNumber: closest.number,
+        isWinner: closest.studentId === studentId,
+        allNumbers: numbers.sort((a, b) => a - b),
+      });
+      setScreen("beauty_result");
+    }, 30000);
+  };
 
   // ================================================================
   // SCREENS
@@ -790,53 +839,7 @@ function App() {
     );
   }
 
-  // ---- P-BEAUTY CONTEST ----
-  const [beautyNumber, setBeautyNumber] = useState("");
-  const [beautyCountdown, setBeautyCountdown] = useState(0);
-  const [beautyResult, setBeautyResult] = useState(null);
-
-  const submitBeauty = async () => {
-    const num = parseInt(beautyNumber);
-    if (isNaN(num) || num < 0 || num > 100) { alert("请输入0-100的整数\nPlease enter an integer from 0 to 100"); return; }
-    if (!firebaseReady) return;
-
-    await db.ref("games/beauty_contest/submissions/" + myId.current).set({
-      name: name || "匿名", studentId: studentId || "", number: num,
-      timestamp: firebase.database.ServerValue.TIMESTAMP,
-    });
-
-    setScreen("beauty_wait");
-
-    // Countdown
-    let t = 30;
-    setBeautyCountdown(t);
-    const timer = setInterval(() => { t--; setBeautyCountdown(t); if (t <= 0) clearInterval(timer); }, 1000);
-
-    // After 30s, compute results
-    setTimeout(async () => {
-      const snap = await db.ref("games/beauty_contest/submissions").once("value");
-      const subs = snap.val();
-      if (!subs) return;
-      const entries = Object.values(subs);
-      const numbers = entries.map(e => e.number);
-      const avg = numbers.reduce((a, b) => a + b, 0) / numbers.length;
-      const target = (2 / 3) * avg;
-      let closest = entries[0];
-      let minDist = Math.abs(entries[0].number - target);
-      entries.forEach(e => {
-        const dist = Math.abs(e.number - target);
-        if (dist < minDist) { minDist = dist; closest = e; }
-      });
-
-      setBeautyResult({
-        myNumber: num, avg: avg.toFixed(1), target: target.toFixed(1),
-        totalPlayers: entries.length, winner: closest.name, winnerNumber: closest.number,
-        isWinner: closest.studentId === studentId,
-        allNumbers: numbers.sort((a, b) => a - b),
-      });
-      setScreen("beauty_result");
-    }, 30000);
-  };
+  // ---- P-BEAUTY CONTEST SCREENS ----
 
   if (screen === "beauty_intro") return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
