@@ -219,7 +219,6 @@ function App() {
   const [screen, setScreen] = useState("home"); // home | intro | play | result | history | teacher | beauty_intro | beauty_play | beauty_wait | beauty_result
   const [gameId, setGameId] = useState("grade_game");
   const [beautyNumber, setBeautyNumber] = useState("");
-  const [beautyCountdown, setBeautyCountdown] = useState(0);
   const [beautyResult, setBeautyResult] = useState(null);
   const [name, setName] = useState(() => {
     try { return localStorage.getItem("gt_name") || ""; } catch { return ""; }
@@ -458,6 +457,10 @@ function App() {
   // ================================================================
   // P-BEAUTY CONTEST LOGIC
   // ================================================================
+  const [beautySubmitted, setBeautySubmitted] = useState(false);
+  const [beautySubCount, setBeautySubCount] = useState(0);
+
+  // Student: submit number and wait for teacher to reveal
   const submitBeauty = async () => {
     const num = parseInt(beautyNumber);
     if (isNaN(num) || num < 0 || num > 100) { alert("请输入0-100的整数\nPlease enter an integer from 0 to 100"); return; }
@@ -468,37 +471,82 @@ function App() {
       timestamp: firebase.database.ServerValue.TIMESTAMP,
     });
 
+    setBeautySubmitted(true);
     setScreen("beauty_wait");
 
-    // Countdown
-    let t = 30;
-    setBeautyCountdown(t);
-    const timer = setInterval(() => { t--; setBeautyCountdown(t); if (t <= 0) clearInterval(timer); }, 1000);
-
-    // After 30s, compute results
-    setTimeout(async () => {
-      const snap = await db.ref("games/beauty_contest/submissions").once("value");
-      const subs = snap.val();
-      if (!subs) return;
-      const entries = Object.values(subs);
-      const numbers = entries.map(e => e.number);
-      const avg = numbers.reduce((a, b) => a + b, 0) / numbers.length;
-      const target = (2 / 3) * avg;
-      let closest = entries[0];
-      let minDist = Math.abs(entries[0].number - target);
-      entries.forEach(e => {
-        const dist = Math.abs(e.number - target);
-        if (dist < minDist) { minDist = dist; closest = e; }
-      });
-
+    // Listen for teacher-triggered results
+    const resultsRef = db.ref("games/beauty_contest/results");
+    const onResults = resultsRef.on("value", (snap) => {
+      const res = snap.val();
+      if (!res) return;
+      resultsRef.off("value", onResults);
       setBeautyResult({
-        myNumber: num, avg: avg.toFixed(1), target: target.toFixed(1),
-        totalPlayers: entries.length, winner: closest.name, winnerNumber: closest.number,
-        isWinner: closest.studentId === studentId,
-        allNumbers: numbers.sort((a, b) => a - b),
+        myNumber: num,
+        avg: res.avg, target: res.target,
+        totalPlayers: res.totalPlayers,
+        winner: res.winner, winnerNumber: res.winnerNumber,
+        isWinner: res.winnerStudentId === studentId,
+        allNumbers: res.allNumbers,
       });
       setScreen("beauty_result");
-    }, 30000);
+    });
+    listenersRef.current.push(() => resultsRef.off("value", onResults));
+  };
+
+  // Listen for submission count (for both students waiting and teacher panel)
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const subRef = db.ref("games/beauty_contest/submissions");
+    const onSub = subRef.on("value", (snap) => {
+      const subs = snap.val();
+      setBeautySubCount(subs ? Object.keys(subs).length : 0);
+    });
+    return () => subRef.off("value", onSub);
+  }, [firebaseReady]);
+
+  // Teacher: compute and publish results
+  const revealBeautyResults = async () => {
+    if (!firebaseReady) return;
+    const snap = await db.ref("games/beauty_contest/submissions").once("value");
+    const subs = snap.val();
+    if (!subs) { alert("没有提交 No submissions yet!"); return; }
+    
+    const entries = Object.values(subs);
+    const numbers = entries.map(e => e.number);
+    const avg = numbers.reduce((a, b) => a + b, 0) / numbers.length;
+    const target = (2 / 3) * avg;
+    
+    let closest = entries[0];
+    let minDist = Math.abs(entries[0].number - target);
+    entries.forEach(e => {
+      const dist = Math.abs(e.number - target);
+      if (dist < minDist) { minDist = dist; closest = e; }
+    });
+
+    // Write results to Firebase — all students listening will see this
+    await db.ref("games/beauty_contest/results").set({
+      avg: avg.toFixed(1), target: target.toFixed(1),
+      totalPlayers: entries.length,
+      winner: closest.name, winnerNumber: closest.number,
+      winnerStudentId: closest.studentId || "",
+      allNumbers: numbers.sort((a, b) => a - b),
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+
+    alert(`✅ 结果已发布！Results published!\n\n参与: ${entries.length} players\n平均: ${avg.toFixed(1)}\n目标 2/3: ${target.toFixed(1)}\n获胜: ${closest.name} (${closest.number})`);
+  };
+
+  // Teacher: reset beauty contest
+  const resetBeautyContest = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("确认清除选美博弈数据？输入 reset 确认\nClear beauty contest? Type 'reset':");
+    if (pw !== "reset") return;
+    await db.ref("games/beauty_contest").remove();
+    setBeautySubmitted(false);
+    setBeautyResult(null);
+    setBeautyNumber("");
+    setBeautySubCount(0);
+    alert("✅ 选美博弈已重置 Beauty contest reset!");
   };
 
   // ================================================================
@@ -907,27 +955,21 @@ function App() {
   if (screen === "beauty_wait") return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
       <div style={{ textAlign: "center" }}>
-        <div style={{ position: "relative", width: 90, height: 90, margin: "0 auto 18px" }}>
-          <svg width="90" height="90" style={{ transform: "rotate(-90deg)" }}>
-            <circle cx="45" cy="45" r="38" fill="none" stroke={`${C.DIM}25`} strokeWidth="4" />
-            <circle cx="45" cy="45" r="38" fill="none" stroke={C.PURPLE} strokeWidth="4"
-              strokeDasharray={`${2 * Math.PI * 38}`}
-              strokeDashoffset={`${2 * Math.PI * 38 * (1 - beautyCountdown / 30)}`}
-              strokeLinecap="round" style={{ transition: "stroke-dashoffset 1s linear" }} />
-          </svg>
-          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, fontWeight: 800, color: C.PURPLE }}>
-            {beautyCountdown}
-          </div>
+        <div style={{ width: 60, height: 60, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.PURPLE, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+
+        <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待老师揭晓结果...</h2>
+        <p style={{ fontSize: 13, color: C.DIM, marginBottom: 16 }}>Submitted! Waiting for teacher to reveal results...</p>
+        
+        <p style={{ fontSize: 18, color: C.PURPLE, fontWeight: 700, marginBottom: 8 }}>
+          你选了 You chose: <span style={{ fontSize: 32, color: C.TEXT }}>{beautyNumber}</span>
+        </p>
+        
+        <div style={{ background: C.SURFACE, borderRadius: 10, padding: 12, marginTop: 16, border: `1px solid ${C.DIM}20` }}>
+          <div style={{ fontSize: 12, color: C.DIM }}>已提交人数 Submissions so far</div>
+          <div style={{ fontSize: 28, fontWeight: 800, color: C.PURPLE }}>{beautySubCount}</div>
         </div>
 
-        <h2 style={{ fontSize: 18, color: C.TEXT, marginBottom: 6 }}>等待同学们提交... Waiting for classmates...</h2>
-        <p style={{ fontSize: 12, color: C.DIM }}>
-          {beautyCountdown > 0 ? `${beautyCountdown} 秒后揭晓 / Results in ${beautyCountdown}s` : "正在计算... Calculating..."}
-        </p>
-        <p style={{ fontSize: 16, color: C.PURPLE, marginTop: 14, fontWeight: 700 }}>
-          你选了 You chose: <span style={{ fontSize: 28, color: C.TEXT }}>{beautyNumber}</span>
-        </p>
-        <p style={{ fontSize: 11, color: C.DIM, marginTop: 6 }}>✓ 已提交 Submitted</p>
+        <p style={{ fontSize: 11, color: C.DIM, marginTop: 12 }}>✓ 已提交 Submitted — 请不要关闭此页面 Don't close this page</p>
       </div>
     </div>
   );
@@ -1082,6 +1124,30 @@ function App() {
               ))}
             </Box>
           )}
+
+          {/* P-Beauty Contest Controls */}
+          <div style={{ background: `${C.PURPLE}08`, border: `1px solid ${C.PURPLE}25`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.PURPLE, marginBottom: 8 }}>🏆 选美博弈 P-Beauty Contest</div>
+            
+            <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+              <div style={{ flex: 1, background: C.SURFACE, borderRadius: 8, padding: 10, textAlign: "center" }}>
+                <div style={{ fontSize: 10, color: C.DIM }}>已提交 Submissions</div>
+                <div style={{ fontSize: 28, fontWeight: 800, color: C.PURPLE }}>{beautySubCount}</div>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn-press" onClick={revealBeautyResults}
+                style={{ flex: 1, padding: 12, fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 10, color: "white", cursor: "pointer", opacity: beautySubCount > 0 ? 1 : 0.4 }}
+                disabled={beautySubCount === 0}>
+                🎉 揭晓结果 Reveal Results
+              </button>
+              <button className="btn-press" onClick={resetBeautyContest}
+                style={{ padding: 12, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>
+                🗑️ 重置 Reset
+              </button>
+            </div>
+          </div>
 
           <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
             <button className="btn-press" onClick={loadStats}
