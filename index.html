@@ -216,7 +216,8 @@ function generateId() {
 // APP COMPONENT
 // ================================================================
 function App() {
-  const [screen, setScreen] = useState("home"); // home | intro | play | result | history | teacher
+  const [screen, setScreen] = useState("home"); // home | intro | play | result | history | teacher | beauty_intro | beauty_play | beauty_wait | beauty_result
+  const [gameId, setGameId] = useState("grade_game");
   const [name, setName] = useState(() => {
     try { return localStorage.getItem("gt_name") || ""; } catch { return ""; }
   });
@@ -235,7 +236,6 @@ function App() {
   const [stats, setStats] = useState({ alpha: 0, beta: 0, results: [] });
   const [waitDots, setWaitDots] = useState("");
 
-  const gameId = "grade_game";
   const game = GAMES[gameId];
   const myId = useRef(generateId());
   const listenersRef = useRef([]);
@@ -491,15 +491,24 @@ function App() {
           onBlur={e => e.target.style.borderColor = `${C.HEADER}40`}
         />
 
-        <div style={{ marginBottom: 12 }}>
+        <div style={{ marginBottom: 12, display: "flex", gap: 10 }}>
           <button className="btn-press" onClick={() => {
             if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
-            setMode("human"); setScreen("intro");
+            setGameId("grade_game"); setMode("human"); setScreen("intro");
           }}
-            style={{ width: "100%", padding: "18px 12px", fontSize: 15, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
+            style={{ flex: 1, padding: "16px 10px", fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
             disabled={!firebaseReady}>
-            <div style={{ fontSize: 22, marginBottom: 2 }}>🎮</div>
-            开始游戏 Start Game
+            <div style={{ fontSize: 20, marginBottom: 2 }}>🎮</div>
+            成绩博弈<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>Grade Game</span>
+          </button>
+          <button className="btn-press" onClick={() => {
+            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
+            setScreen("beauty_intro");
+          }}
+            style={{ flex: 1, padding: "16px 10px", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg, #2D1B4E, #1B1040)", border: `1px solid #4A307060`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: "0 4px 20px #2D1B4E50" }}
+            disabled={!firebaseReady}>
+            <div style={{ fontSize: 20, marginBottom: 2 }}>🏆</div>
+            选美博弈<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>P-Beauty Contest</span>
           </button>
         </div>
 
@@ -781,6 +790,217 @@ function App() {
     );
   }
 
+  // ---- P-BEAUTY CONTEST ----
+  const [beautyNumber, setBeautyNumber] = useState("");
+  const [beautyCountdown, setBeautyCountdown] = useState(0);
+  const [beautyResult, setBeautyResult] = useState(null);
+
+  const submitBeauty = async () => {
+    const num = parseInt(beautyNumber);
+    if (isNaN(num) || num < 0 || num > 100) { alert("请输入0-100的整数\nPlease enter an integer from 0 to 100"); return; }
+    if (!firebaseReady) return;
+
+    await db.ref("games/beauty_contest/submissions/" + myId.current).set({
+      name: name || "匿名", studentId: studentId || "", number: num,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+
+    setScreen("beauty_wait");
+
+    // Countdown
+    let t = 30;
+    setBeautyCountdown(t);
+    const timer = setInterval(() => { t--; setBeautyCountdown(t); if (t <= 0) clearInterval(timer); }, 1000);
+
+    // After 30s, compute results
+    setTimeout(async () => {
+      const snap = await db.ref("games/beauty_contest/submissions").once("value");
+      const subs = snap.val();
+      if (!subs) return;
+      const entries = Object.values(subs);
+      const numbers = entries.map(e => e.number);
+      const avg = numbers.reduce((a, b) => a + b, 0) / numbers.length;
+      const target = (2 / 3) * avg;
+      let closest = entries[0];
+      let minDist = Math.abs(entries[0].number - target);
+      entries.forEach(e => {
+        const dist = Math.abs(e.number - target);
+        if (dist < minDist) { minDist = dist; closest = e; }
+      });
+
+      setBeautyResult({
+        myNumber: num, avg: avg.toFixed(1), target: target.toFixed(1),
+        totalPlayers: entries.length, winner: closest.name, winnerNumber: closest.number,
+        isWinner: closest.studentId === studentId,
+        allNumbers: numbers.sort((a, b) => a - b),
+      });
+      setScreen("beauty_result");
+    }, 30000);
+  };
+
+  if (screen === "beauty_intro") return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
+      <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
+        <button className="btn-press" onClick={() => setScreen("home")}
+          style={{ position: "absolute", top: 16, left: 16, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back 返回</button>
+
+        <div style={{ fontSize: 50, marginBottom: 12 }}>🏆</div>
+        <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>P-Beauty Contest</h2>
+        <p style={{ fontSize: 14, color: C.PURPLE, marginBottom: 20 }}>选美博弈</p>
+
+        <div style={{ background: C.SURFACE, borderRadius: 14, padding: 18, textAlign: "left", marginBottom: 16, border: `1px solid ${C.PURPLE}30` }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.PURPLE, marginBottom: 10 }}>📋 Rules 规则</div>
+          <div style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.7 }}>
+            <p style={{ marginBottom: 8 }}>① 每人选一个 <strong>0到100</strong> 之间的整数</p>
+            <p style={{ marginBottom: 8, color: C.DIM, fontSize: 12 }}>Each player picks an integer from 0 to 100.</p>
+            <p style={{ marginBottom: 8 }}>② 计算所有人提交数字的 <strong>平均值</strong></p>
+            <p style={{ marginBottom: 8, color: C.DIM, fontSize: 12 }}>Compute the average of all submitted numbers.</p>
+            <p style={{ marginBottom: 8 }}>③ 最接近平均值 <strong>2/3</strong> 的人获胜 🏆</p>
+            <p style={{ color: C.DIM, fontSize: 12 }}>The winner is the player closest to 2/3 of the average.</p>
+          </div>
+        </div>
+
+        <div style={{ background: `${C.GOLD}0C`, borderRadius: 12, padding: 12, marginBottom: 16, border: `1px solid ${C.GOLD}25` }}>
+          <div style={{ fontSize: 12, color: C.GOLD }}>💡 Think: 想一想</div>
+          <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.6, marginTop: 4 }}>
+            What do you believe others will choose?<br/>
+            What is your best response to that belief?
+          </div>
+        </div>
+
+        <button className="btn-press" onClick={() => setScreen("beauty_play")}
+          style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", boxShadow: "0 4px 20px #4A307050" }}>
+          开始 Let's Play!
+        </button>
+      </div>
+    </div>
+  );
+
+  if (screen === "beauty_play") return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
+      <div style={{ maxWidth: 400, width: "100%", textAlign: "center" }}>
+        <button className="btn-press" onClick={() => setScreen("beauty_intro")}
+          style={{ position: "absolute", top: 16, left: 16, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back 返回</button>
+
+        <div style={{ fontSize: 42, marginBottom: 8 }}>🎯</div>
+        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>选择你的数字</h2>
+        <p style={{ fontSize: 12, color: C.DIM, marginBottom: 24 }}>Pick your number (0-100)</p>
+
+        <input type="number" min="0" max="100" placeholder="0 - 100" value={beautyNumber}
+          onChange={e => setBeautyNumber(e.target.value)}
+          style={{ width: "100%", padding: "20px 16px", fontSize: 32, fontWeight: 800, background: C.SURFACE, border: `2px solid ${C.PURPLE}50`, borderRadius: 14, color: C.TEXT, outline: "none", textAlign: "center", marginBottom: 16 }}
+          onFocus={e => e.target.style.borderColor = C.PURPLE}
+          onBlur={e => e.target.style.borderColor = `${C.PURPLE}50`}
+        />
+
+        <button className="btn-press" onClick={submitBeauty}
+          style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer" }}>
+          提交 Submit
+        </button>
+      </div>
+    </div>
+  );
+
+  if (screen === "beauty_wait") return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
+      <div style={{ textAlign: "center" }}>
+        <div style={{ position: "relative", width: 90, height: 90, margin: "0 auto 18px" }}>
+          <svg width="90" height="90" style={{ transform: "rotate(-90deg)" }}>
+            <circle cx="45" cy="45" r="38" fill="none" stroke={`${C.DIM}25`} strokeWidth="4" />
+            <circle cx="45" cy="45" r="38" fill="none" stroke={C.PURPLE} strokeWidth="4"
+              strokeDasharray={`${2 * Math.PI * 38}`}
+              strokeDashoffset={`${2 * Math.PI * 38 * (1 - beautyCountdown / 30)}`}
+              strokeLinecap="round" style={{ transition: "stroke-dashoffset 1s linear" }} />
+          </svg>
+          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, fontWeight: 800, color: C.PURPLE }}>
+            {beautyCountdown}
+          </div>
+        </div>
+
+        <h2 style={{ fontSize: 18, color: C.TEXT, marginBottom: 6 }}>等待同学们提交... Waiting for classmates...</h2>
+        <p style={{ fontSize: 12, color: C.DIM }}>
+          {beautyCountdown > 0 ? `${beautyCountdown} 秒后揭晓 / Results in ${beautyCountdown}s` : "正在计算... Calculating..."}
+        </p>
+        <p style={{ fontSize: 16, color: C.PURPLE, marginTop: 14, fontWeight: 700 }}>
+          你选了 You chose: <span style={{ fontSize: 28, color: C.TEXT }}>{beautyNumber}</span>
+        </p>
+        <p style={{ fontSize: 11, color: C.DIM, marginTop: 6 }}>✓ 已提交 Submitted</p>
+      </div>
+    </div>
+  );
+
+  if (screen === "beauty_result" && beautyResult) return (
+    <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
+      <div style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
+        <div style={{ fontSize: 42, marginBottom: 8 }}>{beautyResult.isWinner ? "🎉" : "📊"}</div>
+        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>
+          {beautyResult.isWinner ? "你赢了！You Won!" : "Results 结果"}
+        </h2>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 16, marginBottom: 16 }}>
+          <div style={{ flex: 1, background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.DIM}20` }}>
+            <div style={{ fontSize: 10, color: C.DIM }}>参与人数 Players</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color: C.TEXT }}>{beautyResult.totalPlayers}</div>
+          </div>
+          <div style={{ flex: 1, background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.DIM}20` }}>
+            <div style={{ fontSize: 10, color: C.DIM }}>平均值 Average</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color: C.GOLD }}>{beautyResult.avg}</div>
+          </div>
+          <div style={{ flex: 1, background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.PURPLE}30` }}>
+            <div style={{ fontSize: 10, color: C.DIM }}>目标 2/3 × avg</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color: C.PURPLE }}>{beautyResult.target}</div>
+          </div>
+        </div>
+
+        <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, marginBottom: 14, border: `1px solid ${C.GOLD}30`, textAlign: "left" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>🏆 Winner 获胜者</div>
+          <div style={{ fontSize: 16, color: C.TEXT }}>{beautyResult.winner} — chose <strong style={{ color: C.PURPLE }}>{beautyResult.winnerNumber}</strong></div>
+          <div style={{ fontSize: 12, color: C.DIM, marginTop: 2 }}>Closest to {beautyResult.target}</div>
+        </div>
+
+        <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, marginBottom: 14, border: `1px solid ${C.DIM}20`, textAlign: "left" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.TEXT2, marginBottom: 6 }}>你的选择 Your choice</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: C.PURPLE }}>{beautyResult.myNumber}
+            <span style={{ fontSize: 13, color: C.DIM, fontWeight: 400 }}> — distance from target: {Math.abs(beautyResult.myNumber - parseFloat(beautyResult.target)).toFixed(1)}</span>
+          </div>
+        </div>
+
+        <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, marginBottom: 14, border: `1px solid ${C.DIM}20`, textAlign: "left" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.TEXT2, marginBottom: 8 }}>所有提交 All submissions (sorted)</div>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            {beautyResult.allNumbers.map((n, i) => (
+              <div key={i} style={{
+                padding: "4px 8px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                background: n === beautyResult.myNumber ? `${C.PURPLE}25` : n === beautyResult.winnerNumber ? `${C.GOLD}20` : `${C.DIM}15`,
+                color: n === beautyResult.myNumber ? C.PURPLE : n === beautyResult.winnerNumber ? C.GOLD : C.TEXT2,
+                border: n === beautyResult.winnerNumber ? `1px solid ${C.GOLD}50` : "1px solid transparent",
+              }}>{n}</div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ background: `${C.GOLD}0C`, borderRadius: 12, padding: 12, marginBottom: 14, border: `1px solid ${C.GOLD}25`, textAlign: "left" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 4 }}>💡 Think about it 想一想</div>
+          <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.6 }}>
+            如果每个人都是"理性的"，正确答案应该是什么？我们下周学完迭代消除后再来分析！<br/>
+            <span style={{ color: C.DIM }}>If everyone were "rational", what should the answer be? We'll analyze this formally next week after learning IESDS!</span>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button className="btn-press" onClick={() => { setBeautyNumber(""); setBeautyResult(null); setScreen("beauty_play"); }}
+            style={{ flex: 1, padding: 13, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer" }}>
+            再来一轮 Play Again
+          </button>
+          <button className="btn-press" onClick={() => { setBeautyNumber(""); setBeautyResult(null); setScreen("home"); }}
+            style={{ flex: 1, padding: 13, fontSize: 14, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 12, color: C.TEXT2, cursor: "pointer" }}>
+            返回首页 Home
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
   // ---- TEACHER ----
   if (screen === "teacher") {
     const total = stats.alpha + stats.beta;
@@ -870,8 +1090,9 @@ function App() {
               const pw = prompt("确认清除所有数据？输入 reset 确认\nClear all data? Type 'reset' to confirm:");
               if (pw !== "reset") return;
               await db.ref(`games/${gameId}`).remove();
+              await db.ref("games/beauty_contest").remove();
               setStats({ alpha: 0, beta: 0, results: [] });
-              alert("✅ 数据已清除 / All data cleared");
+              alert("✅ 所有数据已清除（成绩博弈+选美博弈）\nAll data cleared (Grade Game + Beauty Contest)");
             }}
               style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>
               🗑️ 清除 Reset All
