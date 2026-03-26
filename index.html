@@ -256,6 +256,16 @@ function App() {
   const [nashTeacherTab, setNashTeacherTab] = useState("controls");
   const [teacherTab, setTeacherTab] = useState("grade");
 
+  // ---- Investment Game state ----
+  const [investPhase, setInvestPhase] = useState("lobby"); // "lobby" | "open" | "results"
+  const [investRound, setInvestRound] = useState(0);
+  const [investThreshold, setInvestThreshold] = useState(80);
+  const [investSubmitted, setInvestSubmitted] = useState(false);
+  const [investMyChoice, setInvestMyChoice] = useState(null);
+  const [investSubCount, setInvestSubCount] = useState(0);
+  const [investResult, setInvestResult] = useState(null); // {total, invested, pct, threshold, success}
+  const [investAllResults, setInvestAllResults] = useState([]); // [{round, threshold, total, invested, pct, success}]
+
   const game = GAMES[gameId];
   const myId = useRef(generateId());
   const nashId = useRef(() => {
@@ -517,6 +527,136 @@ function App() {
   };
 
   // ================================================================
+  // INVESTMENT GAME — Firebase listeners
+  // ================================================================
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const stateRef = db.ref("games/invest_game/state");
+    const onState = stateRef.on("value", (snap) => {
+      const s = snap.val();
+      if (!s) { setInvestPhase("lobby"); setInvestRound(0); return; }
+      setInvestPhase(s.phase || "lobby");
+      setInvestRound(s.round || 0);
+      if (s.threshold !== undefined) setInvestThreshold(s.threshold);
+    });
+    return () => stateRef.off("value", onState);
+  }, [firebaseReady]);
+
+  // Listen for submission count in current round
+  useEffect(() => {
+    if (!firebaseReady || !investRound) return;
+    const subRef = db.ref(`games/invest_game/rounds/${investRound}/submissions`);
+    const onSub = subRef.on("value", (snap) => {
+      const s = snap.val();
+      setInvestSubCount(s ? Object.keys(s).length : 0);
+    });
+    return () => subRef.off("value", onSub);
+  }, [firebaseReady, investRound]);
+
+  // Listen for results when phase changes
+  useEffect(() => {
+    if (!firebaseReady || investPhase !== "results" || !investRound) return;
+    db.ref(`games/invest_game/rounds/${investRound}/result`).once("value", (snap) => {
+      const r = snap.val();
+      if (r) {
+        setInvestResult(r);
+        setInvestAllResults(prev => {
+          const filtered = prev.filter(x => x.round !== investRound);
+          return [...filtered, { round: investRound, ...r }].sort((a, b) => a.round - b.round);
+        });
+      }
+    });
+  }, [firebaseReady, investPhase, investRound]);
+
+  // Reset submitted when new round starts
+  useEffect(() => {
+    if (investPhase === "open") {
+      setInvestSubmitted(false);
+      setInvestMyChoice(null);
+      setInvestResult(null);
+    }
+  }, [investPhase, investRound]);
+
+  // ================================================================
+  // INVESTMENT GAME — Player functions
+  // ================================================================
+  const submitInvest = async (choice) => {
+    if (!firebaseReady || !investRound || investSubmitted) return;
+    await db.ref(`games/invest_game/rounds/${investRound}/submissions/${myId.current}`).set({
+      choice, name: name || "匿名", studentId: studentId || "",
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setInvestMyChoice(choice);
+    setInvestSubmitted(true);
+  };
+
+  // ================================================================
+  // INVESTMENT GAME — Teacher functions
+  // ================================================================
+  const investStartRound = async (roundNum, threshold) => {
+    if (!firebaseReady) return;
+    await db.ref("games/invest_game/state").set({
+      round: roundNum, phase: "open", threshold: parseInt(threshold),
+    });
+  };
+
+  const investReveal = async () => {
+    if (!firebaseReady || !investRound) return;
+    const snap = await db.ref(`games/invest_game/rounds/${investRound}/submissions`).once("value");
+    const subs = snap.val();
+    if (!subs) { alert("没有提交!"); return; }
+    const entries = Object.values(subs);
+    const total = entries.length;
+    const invested = entries.filter(e => e.choice === "invest").length;
+    const pct = Math.round(invested / total * 100);
+    // Read current threshold
+    const stateSnap = await db.ref("games/invest_game/state").once("value");
+    const threshold = stateSnap.val()?.threshold || 80;
+    const success = pct >= threshold;
+
+    const resultData = { total, invested, notInvested: total - invested, pct, threshold, success };
+
+    // Compute individual payoffs and write back
+    const updates = {};
+    updates[`games/invest_game/rounds/${investRound}/result`] = resultData;
+    updates["games/invest_game/state/phase"] = "results";
+    await db.ref().update(updates);
+
+    // Load all results
+    const allSnap = await db.ref("games/invest_game/rounds").once("value");
+    const rounds = allSnap.val() || {};
+    const allRes = [];
+    for (const [rNum, rData] of Object.entries(rounds)) {
+      if (rData.result) allRes.push({ round: parseInt(rNum), ...rData.result });
+    }
+    setInvestAllResults(allRes.sort((a, b) => a.round - b.round));
+
+    alert(`✅ Round ${investRound}: ${invested}/${total} invested (${pct}%), threshold ${threshold}% → ${success ? "SUCCESS ✓" : "FAIL ✗"}`);
+  };
+
+  const investReset = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("Type 'reset' to confirm:");
+    if (pw !== "reset") return;
+    await db.ref("games/invest_game").remove();
+    setInvestPhase("lobby"); setInvestRound(0); setInvestSubmitted(false);
+    setInvestMyChoice(null); setInvestResult(null); setInvestAllResults([]);
+    setInvestSubCount(0);
+    alert("✅ 投资博弈已重置!");
+  };
+
+  const loadInvestAllResults = async () => {
+    if (!firebaseReady) return;
+    const snap = await db.ref("games/invest_game/rounds").once("value");
+    const rounds = snap.val() || {};
+    const allRes = [];
+    for (const [rNum, rData] of Object.entries(rounds)) {
+      if (rData.result) allRes.push({ round: parseInt(rNum), ...rData.result });
+    }
+    setInvestAllResults(allRes.sort((a, b) => a.round - b.round));
+  };
+
+  // ================================================================
   // GRADE GAME — Human matching (unchanged)
   // ================================================================
   const submitHuman = async (myChoice) => {
@@ -769,13 +909,13 @@ function App() {
           style={{ width: "100%", padding: "13px 16px", fontSize: 15, background: C.SURFACE, border: `1px solid ${C.HEADER}40`, borderRadius: 11, color: C.TEXT, outline: "none", marginBottom: 16 }}
           onFocus={e => e.target.style.borderColor = C.GOLD} onBlur={e => e.target.style.borderColor = `${C.HEADER}40`} />
 
-        {/* Three game buttons */}
-        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        {/* Game buttons — 2x2 grid */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
           <button className="btn-press" onClick={() => {
             if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
             setGameId("grade_game"); setMode("human"); setScreen("intro");
           }}
-            style={{ flex: 1, padding: "14px 6px", fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
+            style={{ padding: "14px 6px", fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
             disabled={!firebaseReady}>
             <div style={{ fontSize: 18, marginBottom: 2 }}>📝</div>
             成绩博弈<br/><span style={{ fontSize: 9, opacity: 0.6, fontWeight: 400 }}>Grade Game</span>
@@ -784,7 +924,7 @@ function App() {
             if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
             setScreen("beauty_intro");
           }}
-            style={{ flex: 1, padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #2D1B4E, #1B1040)", border: `1px solid #4A307060`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: "0 4px 20px #2D1B4E50" }}
+            style={{ padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #2D1B4E, #1B1040)", border: `1px solid #4A307060`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: "0 4px 20px #2D1B4E50" }}
             disabled={!firebaseReady}>
             <div style={{ fontSize: 18, marginBottom: 2 }}>🏆</div>
             选美博弈<br/><span style={{ fontSize: 9, opacity: 0.6, fontWeight: 400 }}>Beauty Contest</span>
@@ -793,17 +933,26 @@ function App() {
             if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
             joinNashGame();
           }}
-            style={{ flex: 1, padding: "14px 6px", fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, ${C.TEAL_DARK}, #0A1F1E)`, border: `1px solid ${C.TEAL}35`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.TEAL}25` }}
+            style={{ padding: "14px 6px", fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, ${C.TEAL_DARK}, #0A1F1E)`, border: `1px solid ${C.TEAL}35`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.TEAL}25` }}
             disabled={!firebaseReady}>
             <div style={{ fontSize: 18, marginBottom: 2 }}>⚖️</div>
             纳什博弈<br/><span style={{ fontSize: 9, opacity: 0.6, fontWeight: 400 }}>Nash Game</span>
+          </button>
+          <button className="btn-press" onClick={() => {
+            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
+            setScreen("invest_intro");
+          }}
+            style={{ padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #2A2008, #1A1508)", border: `1px solid ${C.GOLD}35`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.GOLD}20` }}
+            disabled={!firebaseReady}>
+            <div style={{ fontSize: 18, marginBottom: 2 }}>💰</div>
+            投资博弈<br/><span style={{ fontSize: 9, opacity: 0.6, fontWeight: 400 }}>Investment Game</span>
           </button>
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn-press" onClick={() => {
             const pw = prompt("请输入教师密码:");
-            if (pw === "econ2501") { loadStats(); loadNashAllStats(); setScreen("teacher"); }
+            if (pw === "econ2501") { loadStats(); loadNashAllStats(); loadInvestAllResults(); setScreen("teacher"); }
             else if (pw !== null) alert("密码错误");
           }}
             style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}35`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
@@ -1281,6 +1430,199 @@ function App() {
   }
 
   // ================================================================
+  // INVESTMENT GAME SCREENS
+  // ================================================================
+
+  // ---- INVEST INTRO ----
+  if (screen === "invest_intro") {
+    const isOpen = investPhase === "open" && investRound > 0;
+    const isResults = investPhase === "results" && investRound > 0;
+
+    // Auto-navigate
+    if (isOpen && !investSubmitted) return renderInvestPlay();
+    if (isOpen && investSubmitted) return renderInvestWait();
+    if (isResults) return renderInvestResult();
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1A08)` }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>💰</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>投资博弈</h2>
+          <p style={{ fontSize: 14, color: C.GOLD, marginBottom: 20 }}>Investment Game · Week 4</p>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", border: `1px solid ${C.GOLD}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>📋 规则 Rules</div>
+            <div style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.8 }}>
+              <p style={{ marginBottom: 8 }}>每人有 <strong>100 元</strong>，同时选择：</p>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                <span style={{ fontSize: 20 }}>💰</span>
+                <div><strong style={{ color: C.GREEN }}>投资</strong>：如果足够多同学投资 → 获得 <strong>150 元</strong>（赚50元）<br/>如果太少人投资 → <strong>损失 100 元</strong></div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 20 }}>🏦</span>
+                <div><strong style={{ color: C.TEXT2 }}>不投资</strong>：稳拿 <strong>0 元</strong>，不赚不赔</div>
+              </div>
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.GOLD}08`, border: `1px solid ${C.GOLD}20` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 4 }}>💡 关键问题 Key Question</div>
+            <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.6 }}>
+              "足够多" 到底是多少？这取决于老师设定的门槛。你信任你的同学们吗？<br/>
+              <span style={{ color: C.DIM }}>How many is "enough"? That depends on the threshold the teacher sets. Do you trust your classmates?</span>
+            </div>
+          </Box>
+
+          <div style={{ background: `${C.GOLD}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.GOLD}20` }}>
+            <div style={{ width: 40, height: 40, margin: "0 auto 8px", border: `3px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 13, color: C.TEXT2 }}>等待老师开始... Waiting for teacher to start...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- INVEST PLAY ----
+  function renderInvestPlay() {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1A08)` }}>
+        <div style={{ maxWidth: 400, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.GOLD, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {investRound} · 门槛 Threshold: {investThreshold}%
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>你要投资吗？</h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 8 }}>Do you invest?</p>
+
+          <Box style={{ marginBottom: 20, padding: 12, textAlign: "left" }}>
+            <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.7 }}>
+              如果 <strong style={{ color: C.GOLD }}>≥{investThreshold}%</strong> 的同学选择投资：投资者赚 <strong style={{ color: C.GREEN }}>+50</strong><br/>
+              如果 <strong style={{ color: C.RED }}>&lt;{investThreshold}%</strong> 投资：投资者亏 <strong style={{ color: C.RED }}>−100</strong><br/>
+              不投资：<strong style={{ color: C.TEXT2 }}>0</strong>
+            </div>
+          </Box>
+
+          <div style={{ display: "flex", gap: 16, justifyContent: "center" }}>
+            <button className="btn-press" onClick={() => submitInvest("invest")}
+              style={{ width: 150, height: 140, fontSize: 18, fontWeight: 800, background: "linear-gradient(145deg, #1A2A0F, #0F1A08)", border: `2px solid ${C.GREEN}50`, borderRadius: 18, color: C.GREEN, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: `0 6px 20px ${C.GREEN}15` }}>
+              <div style={{ fontSize: 36, marginBottom: 6 }}>💰</div>
+              投资<br/><span style={{ fontSize: 11, fontWeight: 400, opacity: 0.6 }}>Invest</span>
+            </button>
+            <button className="btn-press" onClick={() => submitInvest("not_invest")}
+              style={{ width: 150, height: 140, fontSize: 18, fontWeight: 800, background: `linear-gradient(145deg, ${C.SURFACE}, #0F1520)`, border: `2px solid ${C.DIM}40`, borderRadius: 18, color: C.TEXT2, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: `0 6px 20px ${C.DIM}10` }}>
+              <div style={{ fontSize: 36, marginBottom: 6 }}>🏦</div>
+              不投资<br/><span style={{ fontSize: 11, fontWeight: 400, opacity: 0.6 }}>Keep</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- INVEST WAIT ----
+  function renderInvestWait() {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1A08)` }}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ width: 50, height: 50, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+          <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待揭晓...</h2>
+          <p style={{ fontSize: 12, color: C.DIM }}>Round {investRound} · Threshold: {investThreshold}%</p>
+          <p style={{ fontSize: 16, color: investMyChoice === "invest" ? C.GREEN : C.TEXT2, marginTop: 12, fontWeight: 700 }}>
+            {investMyChoice === "invest" ? "💰 你选择了投资" : "🏦 你选择了不投资"}
+          </p>
+          <div style={{ background: C.SURFACE, borderRadius: 10, padding: 12, marginTop: 16, border: `1px solid ${C.DIM}20` }}>
+            <div style={{ fontSize: 12, color: C.DIM }}>已提交人数</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color: C.GOLD }}>{investSubCount}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- INVEST RESULT ----
+  function renderInvestResult() {
+    const r = investResult;
+    if (!r) return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: `linear-gradient(165deg, ${C.BG}, #1A1A08)` }}>
+        <div style={{ width: 40, height: 40, border: `3px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      </div>
+    );
+
+    const myPayoff = investMyChoice === "invest" ? (r.success ? 50 : -100) : 0;
+
+    return (
+      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, ${r.success ? "#0B200F" : "#200B0B"})`, overflowY: "auto" }}>
+        <div style={{ maxWidth: 420, margin: "0 auto", textAlign: "center" }}>
+          <div className="fade-up" style={{ fontSize: 48, marginBottom: 8 }}>{r.success ? "🎉" : "💥"}</div>
+          <h2 className="fade-up fade-up-1" style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>
+            {r.success ? "投资成功！" : "投资失败..."}
+          </h2>
+          <p className="fade-up fade-up-1" style={{ fontSize: 14, color: r.success ? C.GREEN : C.RED, marginBottom: 20 }}>
+            {r.success ? "Enough people invested!" : "Not enough investors..."}
+          </p>
+
+          {/* Key stats */}
+          <div className="fade-up fade-up-2" style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+            <Box style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>投资人数</div>
+              <div style={{ fontSize: 28, fontWeight: 800, color: C.GREEN }}>{r.invested}</div>
+              <div style={{ fontSize: 10, color: C.DIM }}>/ {r.total}</div>
+            </Box>
+            <Box style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>投资比例</div>
+              <div style={{ fontSize: 28, fontWeight: 800, color: r.pct >= r.threshold ? C.GREEN : C.RED }}>{r.pct}%</div>
+              <div style={{ fontSize: 10, color: C.DIM }}>门槛 {r.threshold}%</div>
+            </Box>
+            <Box style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>你的收益</div>
+              <div style={{ fontSize: 28, fontWeight: 800, color: myPayoff > 0 ? C.GREEN : myPayoff < 0 ? C.RED : C.TEXT2 }}>{myPayoff > 0 ? "+" : ""}{myPayoff}</div>
+              <div style={{ fontSize: 10, color: C.DIM }}>{investMyChoice === "invest" ? "已投资" : "未投资"}</div>
+            </Box>
+          </div>
+
+          {/* Visual bar */}
+          <Box className="fade-up fade-up-2" style={{ marginBottom: 16, position: "relative" }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>投资率 Investment Rate</div>
+            <div style={{ position: "relative", height: 32, borderRadius: 8, overflow: "hidden", background: `${C.DIM}15` }}>
+              <div style={{ width: `${r.pct}%`, height: "100%", background: r.success ? `linear-gradient(90deg, #2A5A20, ${C.GREEN})` : `linear-gradient(90deg, #5A2020, ${C.RED})`, transition: "width 0.8s ease", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, color: "white" }}>
+                {r.pct > 15 ? `${r.pct}%` : ""}
+              </div>
+              {/* Threshold marker */}
+              <div style={{ position: "absolute", left: `${r.threshold}%`, top: 0, bottom: 0, width: 2, background: C.GOLD, zIndex: 1 }} />
+              <div style={{ position: "absolute", left: `${r.threshold}%`, top: -16, transform: "translateX(-50%)", fontSize: 9, color: C.GOLD, fontWeight: 700 }}>{r.threshold}%</div>
+            </div>
+          </Box>
+
+          {/* All rounds comparison */}
+          {investAllResults.length > 1 && (
+            <Box className="fade-up fade-up-3" style={{ marginBottom: 16, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>📊 各轮对比 Round Comparison</div>
+              {investAllResults.map((res, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < investAllResults.length - 1 ? `1px solid ${C.DIM}15` : "none" }}>
+                  <span style={{ fontSize: 11, color: C.DIM, width: 28 }}>R{res.round}</span>
+                  <span style={{ fontSize: 11, color: C.GOLD, width: 40 }}>{res.threshold}%</span>
+                  <div style={{ flex: 1, height: 16, borderRadius: 4, overflow: "hidden", background: `${C.DIM}15`, position: "relative" }}>
+                    <div style={{ width: `${res.pct}%`, height: "100%", background: res.success ? C.GREEN : C.RED, borderRadius: 4 }} />
+                    <div style={{ position: "absolute", left: `${res.threshold}%`, top: 0, bottom: 0, width: 1.5, background: `${C.GOLD}80` }} />
+                  </div>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: res.success ? C.GREEN : C.RED, width: 36, textAlign: "right" }}>{res.pct}%</span>
+                  <span style={{ fontSize: 13 }}>{res.success ? "✓" : "✗"}</span>
+                </div>
+              ))}
+            </Box>
+          )}
+
+          {/* Waiting for next round */}
+          <div style={{ background: `${C.GOLD}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.GOLD}20` }}>
+            <div style={{ width: 30, height: 30, margin: "0 auto 8px", border: `2px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 12, color: C.TEXT2 }}>等待老师开始下一轮... Waiting for next round...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ================================================================
   // TEACHER PANEL
   // ================================================================
   if (screen === "teacher") {
@@ -1296,9 +1638,9 @@ function App() {
 
           {/* Tab switcher */}
           <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
-            {[{ id: "grade", label: "📝 成绩", en: "Grade" }, { id: "beauty", label: "🏆 选美", en: "Beauty" }, { id: "nash", label: "⚖️ 纳什", en: "Nash" }].map(t => (
-              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); }}
-                style={{ flex: 1, padding: "10px 8px", fontSize: 13, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
+            {[{ id: "grade", label: "📝 成绩", en: "Grade" }, { id: "beauty", label: "🏆 选美", en: "Beauty" }, { id: "nash", label: "⚖️ 纳什", en: "Nash" }, { id: "invest", label: "💰 投资", en: "Invest" }].map(t => (
+              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); }}
+                style={{ flex: 1, padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
                 {t.label}
               </button>
             ))}
@@ -1461,6 +1803,89 @@ function App() {
               <button className="btn-press" onClick={loadNashAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 12 }}>
                 🔄 刷新数据 Refresh
               </button>
+            </div>
+          )}
+
+          {/* ---- INVEST TAB ---- */}
+          {teacherTab === "invest" && (
+            <div>
+              {/* Status */}
+              <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>轮次 Round</div>
+                  <div style={{ fontSize: 32, fontWeight: 800, color: C.GOLD }}>{investRound || "—"}</div>
+                </Box>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>已提交</div>
+                  <div style={{ fontSize: 32, fontWeight: 800, color: C.TEXT }}>{investSubCount}</div>
+                </Box>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>阶段</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: investPhase === "open" ? C.GREEN : investPhase === "results" ? C.GOLD : C.DIM, marginTop: 6 }}>
+                    {investPhase === "open" ? "进行中" : investPhase === "results" ? "已揭晓" : "等待中"}
+                  </div>
+                </Box>
+              </div>
+
+              {/* Threshold input + start */}
+              {(investPhase === "lobby" || investPhase === "results") && (
+                <Box style={{ marginBottom: 16, border: `1px solid ${C.GOLD}25` }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>设置门槛 Set Threshold</div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                    {[20, 50, 80].map(t => (
+                      <button key={t} className="btn-press" onClick={() => setInvestThreshold(t)}
+                        style={{ flex: 1, padding: "10px 6px", fontSize: 14, fontWeight: 700, background: investThreshold === t ? `${C.GOLD}25` : "transparent", border: `1px solid ${investThreshold === t ? C.GOLD : C.DIM}40`, borderRadius: 8, color: investThreshold === t ? C.GOLD : C.DIM, cursor: "pointer" }}>
+                        {t}%
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+                    <span style={{ fontSize: 12, color: C.TEXT2 }}>自定义:</span>
+                    <input type="number" min="1" max="100" value={investThreshold}
+                      onChange={e => setInvestThreshold(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
+                      style={{ width: 70, padding: "6px 10px", fontSize: 16, fontWeight: 700, background: C.SURFACE, border: `1px solid ${C.GOLD}40`, borderRadius: 8, color: C.GOLD, textAlign: "center", outline: "none" }} />
+                    <span style={{ fontSize: 12, color: C.DIM }}>%</span>
+                  </div>
+                  <button className="btn-press" onClick={() => investStartRound((investRound || 0) + 1, investThreshold)}
+                    style={{ width: "100%", padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A2008, #1A1508)`, border: `1px solid ${C.GOLD}50`, borderRadius: 12, color: C.GOLD, cursor: "pointer" }}>
+                    ▶️ {investRound ? `开始第 ${investRound + 1} 轮 (${investThreshold}%)` : `开始第 1 轮 (${investThreshold}%)`}
+                  </button>
+                </Box>
+              )}
+
+              {/* Reveal button */}
+              {investPhase === "open" && (
+                <button className="btn-press" onClick={investReveal}
+                  style={{ width: "100%", padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A0F, #1A1008)`, border: `1px solid ${C.AMBER}50`, borderRadius: 12, color: C.AMBER, cursor: "pointer", marginBottom: 16 }}>
+                  🎉 揭晓结果 Reveal ({investSubCount} submitted, threshold {investThreshold}%)
+                </button>
+              )}
+
+              {/* All rounds results */}
+              {investAllResults.length > 0 && (
+                <Box style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>📊 各轮结果 All Rounds</div>
+                  {investAllResults.map((res, i) => (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: i < investAllResults.length - 1 ? `1px solid ${C.DIM}15` : "none" }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: C.TEXT, width: 30 }}>R{res.round}</span>
+                      <span style={{ fontSize: 12, color: C.GOLD, width: 45 }}>≥{res.threshold}%</span>
+                      <div style={{ flex: 1, height: 20, borderRadius: 5, overflow: "hidden", background: `${C.DIM}15`, position: "relative" }}>
+                        <div style={{ width: `${res.pct}%`, height: "100%", background: res.success ? C.GREEN : C.RED, borderRadius: 5 }} />
+                        <div style={{ position: "absolute", left: `${res.threshold}%`, top: 0, bottom: 0, width: 2, background: `${C.GOLD}` }} />
+                      </div>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: res.success ? C.GREEN : C.RED, width: 55, textAlign: "right" }}>
+                        {res.invested}/{res.total} ({res.pct}%)
+                      </span>
+                      <span style={{ fontSize: 14 }}>{res.success ? "✓" : "✗"}</span>
+                    </div>
+                  ))}
+                </Box>
+              )}
+
+              <div style={{ display: "flex", gap: 10 }}>
+                <button className="btn-press" onClick={loadInvestAllResults} style={{ flex: 1, padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>🔄 刷新</button>
+                <button className="btn-press" onClick={investReset} style={{ flex: 1, padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>🗑️ 重置</button>
+              </div>
             </div>
           )}
         </div>
