@@ -47,16 +47,8 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 // ================================================================
-// 🔥 FIREBASE CONFIG — Replace with your own!
+// 🔥 FIREBASE CONFIG
 // ================================================================
-// Steps:
-// 1. Go to https://console.firebase.google.com
-// 2. Click "Add project" → name it "game-theory-lab" → Create
-// 3. Click "Build" → "Realtime Database" → "Create Database" → Start in TEST mode
-// 4. Go to Project Settings (gear icon) → scroll to "Your apps" → click "</>" (Web)
-// 5. Register app → copy the firebaseConfig object → paste below
-// ================================================================
-
 const firebaseConfig = {
   apiKey: "AIzaSyCPofplryBpIRHJyidUvej1kEj_7f_EFNQ",
   authDomain: "game-theory-36dc1.firebaseapp.com",
@@ -90,24 +82,18 @@ const C = {
   DIM: "#5A6478", GREEN: "#4CAF50", PURPLE: "#B08DE0",
   ALPHA_BG: "#1A3050", BETA_BG: "#2A1A40",
   ALPHA_C: "#5BA8E0", BETA_C: "#B08DE0",
+  TEAL: "#4ECDC4", TEAL_BG: "#0F2A28", TEAL_DARK: "#1A3A38",
+  AMBER: "#E0A84E",
 };
 
 // ================================================================
-// GAME DEFINITIONS
+// GRADE GAME DEFINITION
 // ================================================================
-// ┌─────────────────────────────────────────────────────────┐
-// │  TO ADD A NEW GAME EACH WEEK:                           │
-// │  1. Copy the grade_game template below                  │
-// │  2. Change the id, name, strategies, payoffs, etc.      │
-// │  3. Save and re-upload to GitHub                        │
-// │  That's it! The app auto-detects all games in GAMES.    │
-// └─────────────────────────────────────────────────────────┘
 const GAMES = {
   grade_game: {
     id: "grade_game", name: "The Grade Game", nameCN: "成绩博弈", week: 1,
     desc: "Choose α or β. Your grade depends on both choices.",
     descCN: "选择 α 或 β。你的成绩取决于双方的选择。",
-    // ---- INTRO / STORY ----
     intro: {
       emoji: "📝",
       story: "你正在参加一门课程的考试。教授有一个特别的评分规则：你的成绩不仅取决于你自己的选择，还取决于和你随机配对的另一个同学的选择。",
@@ -146,13 +132,30 @@ const GAMES = {
   },
 };
 
+// ================================================================
+// NASH GAME CONSTANTS
+// ================================================================
+const NASH = {
+  P1_STRATS: ["U", "M", "D"],
+  P2_STRATS: ["L", "R"],
+  PAYOFFS: {
+    "U,L": { p1: 1, p2: 2 }, "U,R": { p1: 3, p2: 4 },
+    "M,L": { p1: 4, p2: 5 }, "M,R": { p1: 2, p2: 4 },
+    "D,L": { p1: 5, p2: 2 }, "D,R": { p1: 1, p2: 3 },
+  },
+  NE: { p1: "U", p2: "R", p1Pay: 3, p2Pay: 4 },
+  STRAT_COLORS: {
+    U: "#4ECDC4", M: "#E0A84E", D: "#E07B7B",
+    L: "#7BA8E0", R: "#A8E07B",
+  },
+};
+
 // AI — Claude via Anthropic API
 async function getClaudeChoice(game, history) {
   try {
     const historyStr = history.length > 0
       ? "Previous rounds: " + history.map((h, i) => `Round ${i+1}: human=${h.mine}, AI=${h.opp}`).join("; ")
       : "This is the first round.";
-
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -163,24 +166,16 @@ async function getClaudeChoice(game, history) {
           role: "user",
           content: `You are playing a game theory game called "${game.name}" against a human student.
 Available strategies: ${game.strategies.join(", ")}
-
 OUTCOME matrix (grades, NOT payoffs):
   α,α → B−, B−
   α,β → A, C  
   β,α → C, A
   β,β → B+, B+
-
 IMPORTANT: These are OUTCOMES (grades), not payoffs. The payoffs depend on PREFERENCES. 
-- If you are a "selfish" player (evil git) who only cares about your own grade: A=3, B+=1, B−=0, C=−1 → α is dominant.
-- If you are an "indignant angel" who feels guilt getting A while partner gets C, or anger getting C while partner gets A → the game changes completely, and there may be no dominant strategy.
-- The game theory lesson here is: the same outcomes + different preferences = completely different games.
-
 ${historyStr}
-
-You must decide what kind of player you are and choose accordingly. Be creative — maybe you're selfish, maybe you care about fairness, maybe you're vengeful. Your personality can evolve across rounds.
-
+You must decide what kind of player you are and choose accordingly.
 Respond in EXACTLY this JSON format, nothing else:
-{"choice":"α or β","reasoning_cn":"2-4句中文。先说明你的偏好/性格（你在乎什么），然后解释这如何影响你的策略选择。引用博弈论概念。","reasoning_en":"2-4 sentences in English. First state your preferences/personality, then explain how this affects your strategy. Reference game theory concepts."}`
+{"choice":"α or β","reasoning_cn":"2-4句中文。","reasoning_en":"2-4 sentences in English."}`
         }]
       })
     });
@@ -193,7 +188,6 @@ Respond in EXACTLY this JSON format, nothing else:
         return { choice: parsed.choice, reasoningCN: parsed.reasoning_cn, reasoningEN: parsed.reasoning_en };
       }
     } catch {}
-    // Fallback: try to find strategy in raw text
     for (const s of game.strategies) {
       if (text.includes(s)) return { choice: s, reasoningCN: "AI选择了策略 " + s, reasoningEN: "AI chose strategy " + s };
     }
@@ -206,294 +200,83 @@ Respond in EXACTLY this JSON format, nothing else:
 }
 
 // ================================================================
-// FIREBASE HELPERS
+// HELPERS
 // ================================================================
 function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+}
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
 // ================================================================
 // APP COMPONENT
 // ================================================================
 function App() {
-  const [screen, setScreen] = useState("home"); // home | intro | play | result | history | teacher | beauty_intro | beauty_play | beauty_wait | beauty_result
+  // ---- Shared state ----
+  const [screen, setScreen] = useState("home");
   const [gameId, setGameId] = useState("grade_game");
-  const [beautyNumber, setBeautyNumber] = useState("");
-  const [beautyResult, setBeautyResult] = useState(null);
-  const [name, setName] = useState(() => {
-    try { return localStorage.getItem("gt_name") || ""; } catch { return ""; }
-  });
-  const [studentId, setStudentId] = useState(() => {
-    try { return localStorage.getItem("gt_sid") || ""; } catch { return ""; }
-  });
+  const [name, setName] = useState(() => { try { return localStorage.getItem("gt_name") || ""; } catch { return ""; } });
+  const [studentId, setStudentId] = useState(() => { try { return localStorage.getItem("gt_sid") || ""; } catch { return ""; } });
   const [sessionCode, setSessionCode] = useState("");
   const [section, setSection] = useState("");
+
+  // ---- Grade Game state ----
   const [mode, setMode] = useState("human");
-  const [aiType, setAiType] = useState("random");
   const [waiting, setWaiting] = useState(false);
   const [choice, setChoice] = useState(null);
   const [result, setResult] = useState(null);
   const [showMatrix, setShowMatrix] = useState(false);
   const [aiHistory, setAiHistory] = useState([]);
   const [stats, setStats] = useState({ alpha: 0, beta: 0, results: [] });
-  const [waitDots, setWaitDots] = useState("");
-
-  const game = GAMES[gameId];
-  const myId = useRef(generateId());
-  const listenersRef = useRef([]);
-
-  // Save name & student ID
-  useEffect(() => {
-    try { if (name) localStorage.setItem("gt_name", name); } catch {}
-  }, [name]);
-  useEffect(() => {
-    try { if (studentId) localStorage.setItem("gt_sid", studentId); } catch {}
-  }, [studentId]);
-
-  // Waiting dots animation
-  useEffect(() => {
-    if (!waiting) return;
-    const iv = setInterval(() => setWaitDots(d => d.length >= 3 ? "" : d + "."), 500);
-    return () => clearInterval(iv);
-  }, [waiting]);
-
-  // Cleanup firebase listeners on unmount
-  useEffect(() => {
-    return () => listenersRef.current.forEach(off => off());
-  }, []);
-
-  // ---- HUMAN MATCHING via Firebase (Batch mode) ----
-  // Students submit, wait for matching window, then get randomly paired
   const [countdown, setCountdown] = useState(0);
 
-  const submitHuman = async (myChoice) => {
-    if (!firebaseReady) {
-      alert("Firebase 未配置！请按照说明设置 Firebase。\nFirebase not configured! Follow setup instructions.");
-      return;
-    }
-    setChoice(myChoice);
-    setWaiting(true);
-
-    // Submit to pending pool
-    const myRef = db.ref(`games/${gameId}/pending/${myId.current}`);
-    await myRef.set({
-      name: name || "匿名",
-      studentId: studentId || "",
-      choice: myChoice,
-      timestamp: firebase.database.ServerValue.TIMESTAMP,
-    });
-
-    // Start countdown (30 seconds)
-    let timeLeft = 30;
-    setCountdown(timeLeft);
-    const timer = setInterval(() => {
-      timeLeft--;
-      setCountdown(timeLeft);
-      if (timeLeft <= 0) clearInterval(timer);
-    }, 1000);
-
-    // Only start listening for match AFTER 30 seconds
-    // This ensures everyone waits the full countdown
-    setTimeout(() => {
-      const matchRef = db.ref(`games/${gameId}/matches/${myId.current}`);
-      const onMatch = matchRef.on("value", (snap) => {
-        const match = snap.val();
-        if (!match) return;
-        matchRef.off("value", onMatch);
-        const key = `${myChoice},${match.opponentChoice}`;
-        const po = game.payoffs[key];
-        const res = {
-          myChoice, oppChoice: match.opponentChoice,
-          oppName: match.opponentName,
-          label: po.label, myPay: po.p1, oppPay: po.p2, key,
-        };
-        setResult(res);
-        setWaiting(false);
-        setCountdown(0);
-        setScreen("result");
-
-        // Record to results log
-        db.ref(`games/${gameId}/results`).push({
-          player: name || "匿名", studentId: studentId || "",
-          choice: myChoice,
-          opponent: match.opponentName, oppChoice: match.opponentChoice,
-          payoff: po.p1, timestamp: firebase.database.ServerValue.TIMESTAMP,
-        });
-      });
-      listenersRef.current.push(() => matchRef.off("value", onMatch));
-    }, 30000);
-
-    // After 30 seconds, try to match everyone
-    setTimeout(async () => {
-      // Check if already matched
-      const myMatchSnap = await db.ref(`games/${gameId}/matches/${myId.current}`).once("value");
-      if (myMatchSnap.val()) return; // Already matched
-
-      // Read all pending submissions
-      const snap = await db.ref(`games/${gameId}/pending`).once("value");
-      const pending = snap.val();
-      if (!pending) {
-        matchRef.off("value", onMatch);
-        setWaiting(false);
-        setCountdown(0);
-        alert("没有其他人提交，请稍后重试。\nNo other submissions. Please try again.");
-        setScreen("play");
-        setChoice(null);
-        return;
-      }
-
-      // Get all other players
-      const others = Object.entries(pending).filter(([id]) => id !== myId.current);
-
-      if (others.length === 0) {
-        matchRef.off("value", onMatch);
-        myRef.remove();
-        setWaiting(false);
-        setCountdown(0);
-        alert("没有找到对手，请等其他同学也提交后重试。\nNo opponent found. Wait for classmates to submit and try again.");
-        setScreen("play");
-        setChoice(null);
-        return;
-      }
-
-      // Pick a random opponent (with replacement — don't remove them from pending)
-      // This way odd-numbered students still get matched
-      const randomIdx = Math.floor(Math.random() * others.length);
-      const [oppId, oppData] = others[randomIdx];
-
-      // Create match — only remove SELF from pending, not opponent
-      // Opponent stays available for other unmatched students
-      const updates = {};
-      updates[`games/${gameId}/pending/${myId.current}`] = null;
-      updates[`games/${gameId}/matches/${myId.current}`] = {
-        opponentChoice: oppData.choice,
-        opponentName: oppData.name,
-      };
-
-      // Also try to match the opponent with us (if they haven't been matched yet)
-      const oppMatchSnap = await db.ref(`games/${gameId}/matches/${oppId}`).once("value");
-      if (!oppMatchSnap.val()) {
-        updates[`games/${gameId}/pending/${oppId}`] = null;
-        updates[`games/${gameId}/matches/${oppId}`] = {
-          opponentChoice: myChoice,
-          opponentName: name || "匿名",
-        };
-      }
-
-      try {
-        await db.ref().update(updates);
-      } catch (e) {
-        console.log("Match conflict, retrying...");
-      }
-    }, 30000);
-  };
-
-  // ---- AI PLAY ----
-  const submitAI = async (myChoice) => {
-    setChoice(myChoice);
-    setWaiting(true);
-    const aiResult = await getClaudeChoice(game, aiHistory);
-    const key = `${myChoice},${aiResult.choice}`;
-    const po = game.payoffs[key];
-    const res = {
-      myChoice, oppChoice: aiResult.choice,
-      oppName: "Claude AI",
-      label: po.label, myPay: po.p1, oppPay: po.p2, key,
-      aiReasoningCN: aiResult.reasoningCN,
-      aiReasoningEN: aiResult.reasoningEN,
-    };
-    setAiHistory(prev => [...prev, { mine: myChoice, opp: aiResult.choice }]);
-    setResult(res);
-    setWaiting(false);
-    setScreen("result");
-  };
-
-  const handleChoice = (c) => {
-    if (mode === "ai") submitAI(c);
-    else submitHuman(c);
-  };
-
-  const playAgain = () => {
-    myId.current = generateId();
-    setChoice(null); setResult(null); setScreen("play");
-  };
-
-  // ---- TEACHER STATS ----
-  const loadStats = () => {
-    if (!firebaseReady) {
-      setStats({ alpha: 0, beta: 0, results: [] });
-      return;
-    }
-    db.ref(`games/${gameId}/results`).orderByChild("timestamp").limitToLast(200)
-      .once("value", (snap) => {
-        const data = snap.val() || {};
-        const results = Object.values(data).sort((a,b) => (b.timestamp||0) - (a.timestamp||0));
-        const alpha = results.filter(r => r.choice === "α").length;
-        const beta = results.filter(r => r.choice === "β").length;
-        setStats({ alpha, beta, results });
-      });
-  };
-
-  // ================================================================
-  // RENDER HELPERS
-  // ================================================================
-  const Box = ({ children, style, ...props }) => (
-    <div style={{ background: C.SURFACE, borderRadius: 14, padding: 16, border: `1px solid ${C.HEADER}25`, ...style }} {...props}>
-      {children}
-    </div>
-  );
-
-  const Btn = ({ children, primary, style, ...props }) => (
-    <button className="btn-press" style={{
-      padding: "14px 20px", fontSize: 15, fontWeight: 700, border: "none",
-      borderRadius: 12, cursor: "pointer", width: "100%",
-      background: primary ? `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})` : "transparent",
-      color: primary ? "white" : C.TEXT2,
-      border: primary ? "none" : `1px solid ${C.DIM}40`,
-      ...style,
-    }} {...props}>{children}</button>
-  );
-
-  // ================================================================
-  // P-BEAUTY CONTEST LOGIC
-  // ================================================================
+  // ---- Beauty Contest state ----
+  const [beautyNumber, setBeautyNumber] = useState("");
+  const [beautyResult, setBeautyResult] = useState(null);
   const [beautySubmitted, setBeautySubmitted] = useState(false);
   const [beautySubCount, setBeautySubCount] = useState(0);
 
-  // Student: submit number and wait for teacher to reveal
-  const submitBeauty = async () => {
-    const num = parseInt(beautyNumber);
-    if (isNaN(num) || num < 0 || num > 100) { alert("请输入0-100的整数\nPlease enter an integer from 0 to 100"); return; }
-    if (!firebaseReady) return;
+  // ---- Nash Game state ----
+  const [nashRole, setNashRole] = useState(null); // "P1" or "P2"
+  const [nashPhase, setNashPhase] = useState("lobby"); // "lobby" | "playing" | "results"
+  const [nashRound, setNashRound] = useState(0);
+  const [nashSubmitted, setNashSubmitted] = useState(false);
+  const [nashMyResult, setNashMyResult] = useState(null);
+  const [nashHistory, setNashHistory] = useState([]); // [{round, myChoice, oppChoice, myPay, oppPay, oppName}]
+  const [nashSubCounts, setNashSubCounts] = useState({ p1: 0, p2: 0 });
+  const [nashPlayerCounts, setNashPlayerCounts] = useState({ p1: 0, p2: 0 });
+  const [nashRoundStats, setNashRoundStats] = useState(null); // current round stats
+  const [nashAllStats, setNashAllStats] = useState([]); // [{round, p1: {U,M,D}, p2: {L,R}}]
+  const [nashTeacherTab, setNashTeacherTab] = useState("controls");
 
-    await db.ref("games/beauty_contest/submissions/" + myId.current).set({
-      name: name || "匿名", studentId: studentId || "", number: num,
-      timestamp: firebase.database.ServerValue.TIMESTAMP,
-    });
+  const game = GAMES[gameId];
+  const myId = useRef(generateId());
+  const nashId = useRef(() => {
+    try {
+      let id = localStorage.getItem("gt_nash_id");
+      if (!id) { id = generateId(); localStorage.setItem("gt_nash_id", id); }
+      return id;
+    } catch { return generateId(); }
+  });
+  // Initialize nashId properly
+  if (typeof nashId.current === "function") nashId.current = nashId.current();
 
-    setBeautySubmitted(true);
-    setScreen("beauty_wait");
+  const listenersRef = useRef([]);
 
-    // Listen for teacher-triggered results
-    const resultsRef = db.ref("games/beauty_contest/results");
-    const onResults = resultsRef.on("value", (snap) => {
-      const res = snap.val();
-      if (!res) return;
-      resultsRef.off("value", onResults);
-      setBeautyResult({
-        myNumber: num,
-        avg: res.avg, target: res.target,
-        totalPlayers: res.totalPlayers,
-        winner: res.winner, winnerNumber: res.winnerNumber,
-        isWinner: res.winnerStudentId === studentId,
-        allNumbers: res.allNumbers,
-      });
-      setScreen("beauty_result");
-    });
-    listenersRef.current.push(() => resultsRef.off("value", onResults));
-  };
+  // Save name & student ID
+  useEffect(() => { try { if (name) localStorage.setItem("gt_name", name); } catch {} }, [name]);
+  useEffect(() => { try { if (studentId) localStorage.setItem("gt_sid", studentId); } catch {} }, [studentId]);
 
-  // Listen for submission count (for both students waiting and teacher panel)
+  // Cleanup firebase listeners on unmount
+  useEffect(() => { return () => listenersRef.current.forEach(off => off()); }, []);
+
+  // Beauty contest submission count listener
   useEffect(() => {
     if (!firebaseReady) return;
     const subRef = db.ref("games/beauty_contest/submissions");
@@ -504,49 +287,462 @@ function App() {
     return () => subRef.off("value", onSub);
   }, [firebaseReady]);
 
-  // Teacher: compute and publish results
+  // ================================================================
+  // NASH GAME — Firebase listeners
+  // ================================================================
+  const nashListenersRef = useRef([]);
+
+  // Listen for game state changes (round, phase)
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const stateRef = db.ref("games/nash_game/state");
+    const onState = stateRef.on("value", (snap) => {
+      const s = snap.val();
+      if (!s) { setNashPhase("lobby"); setNashRound(0); return; }
+      setNashPhase(s.phase || "lobby");
+      setNashRound(s.round || 0);
+    });
+    nashListenersRef.current.push(() => stateRef.off("value", onState));
+
+    // Listen for player counts
+    const playersRef = db.ref("games/nash_game/players");
+    const onPlayers = playersRef.on("value", (snap) => {
+      const p = snap.val() || {};
+      const vals = Object.values(p);
+      setNashPlayerCounts({
+        p1: vals.filter(v => v.role === "P1").length,
+        p2: vals.filter(v => v.role === "P2").length,
+      });
+    });
+    nashListenersRef.current.push(() => playersRef.off("value", onPlayers));
+
+    return () => nashListenersRef.current.forEach(off => off());
+  }, [firebaseReady]);
+
+  // Listen for submission counts in current round
+  useEffect(() => {
+    if (!firebaseReady || !nashRound) return;
+    const subRef = db.ref(`games/nash_game/rounds/${nashRound}/submissions`);
+    const onSub = subRef.on("value", (snap) => {
+      const s = snap.val() || {};
+      const vals = Object.values(s);
+      setNashSubCounts({
+        p1: vals.filter(v => v.role === "P1").length,
+        p2: vals.filter(v => v.role === "P2").length,
+      });
+    });
+    return () => subRef.off("value", onSub);
+  }, [firebaseReady, nashRound]);
+
+  // Listen for my match result when phase changes to "results"
+  useEffect(() => {
+    if (!firebaseReady || nashPhase !== "results" || !nashRound) return;
+    const resRef = db.ref(`games/nash_game/rounds/${nashRound}/playerResults/${nashId.current}`);
+    resRef.once("value", (snap) => {
+      const r = snap.val();
+      if (r) {
+        setNashMyResult(r);
+        // Add to history if not already there
+        setNashHistory(prev => {
+          if (prev.find(h => h.round === nashRound)) return prev;
+          return [...prev, { round: nashRound, ...r }];
+        });
+      }
+    });
+    // Also load round stats
+    const statsRef = db.ref(`games/nash_game/rounds/${nashRound}/stats`);
+    statsRef.once("value", (snap) => {
+      const s = snap.val();
+      if (s) {
+        setNashRoundStats(s);
+        setNashAllStats(prev => {
+          const filtered = prev.filter(x => x.round !== nashRound);
+          return [...filtered, { round: nashRound, ...s }].sort((a, b) => a.round - b.round);
+        });
+      }
+    });
+  }, [firebaseReady, nashPhase, nashRound]);
+
+  // When new round starts (phase back to "playing"), reset submitted
+  useEffect(() => {
+    if (nashPhase === "playing") {
+      setNashSubmitted(false);
+      setNashMyResult(null);
+      setNashRoundStats(null);
+    }
+  }, [nashPhase, nashRound]);
+
+  // Load all historical stats for teacher chart
+  const loadNashAllStats = async () => {
+    if (!firebaseReady) return;
+    const snap = await db.ref("games/nash_game/rounds").once("value");
+    const rounds = snap.val() || {};
+    const allStats = [];
+    for (const [roundNum, roundData] of Object.entries(rounds)) {
+      if (roundData.stats) {
+        allStats.push({ round: parseInt(roundNum), ...roundData.stats });
+      }
+    }
+    setNashAllStats(allStats.sort((a, b) => a.round - b.round));
+  };
+
+  // ================================================================
+  // NASH GAME — Player functions
+  // ================================================================
+  const joinNashGame = async () => {
+    if (!firebaseReady) return;
+    // Check if already joined
+    const existSnap = await db.ref(`games/nash_game/players/${nashId.current}`).once("value");
+    if (existSnap.val()) {
+      setNashRole(existSnap.val().role);
+      setScreen("nash_lobby");
+      return;
+    }
+    // Assign role based on current counts
+    const playersSnap = await db.ref("games/nash_game/players").once("value");
+    const players = playersSnap.val() || {};
+    const vals = Object.values(players);
+    const p1Count = vals.filter(v => v.role === "P1").length;
+    const p2Count = vals.filter(v => v.role === "P2").length;
+    const role = p1Count <= p2Count ? "P1" : "P2";
+
+    await db.ref(`games/nash_game/players/${nashId.current}`).set({
+      name: name || "匿名", studentId: studentId || "", role,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setNashRole(role);
+    setScreen("nash_lobby");
+  };
+
+  const submitNashChoice = async (myChoice) => {
+    if (!firebaseReady || !nashRound || nashSubmitted) return;
+    await db.ref(`games/nash_game/rounds/${nashRound}/submissions/${nashId.current}`).set({
+      choice: myChoice, role: nashRole, name: name || "匿名",
+      studentId: studentId || "",
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setNashSubmitted(true);
+  };
+
+  // ================================================================
+  // NASH GAME — Teacher functions
+  // ================================================================
+  const nashStartRound = async (roundNum) => {
+    if (!firebaseReady) return;
+    await db.ref("games/nash_game/state").set({ round: roundNum, phase: "playing" });
+  };
+
+  const nashEndRound = async () => {
+    if (!firebaseReady || !nashRound) return;
+    // Read submissions
+    const snap = await db.ref(`games/nash_game/rounds/${nashRound}/submissions`).once("value");
+    const subs = snap.val();
+    if (!subs) { alert("没有提交 No submissions!"); return; }
+
+    const entries = Object.entries(subs);
+    const p1Subs = shuffle(entries.filter(([_, v]) => v.role === "P1"));
+    const p2Subs = shuffle(entries.filter(([_, v]) => v.role === "P2"));
+
+    if (p1Subs.length === 0 || p2Subs.length === 0) {
+      alert("需要至少一个P1和一个P2! Need at least one P1 and one P2!");
+      return;
+    }
+
+    // Compute stats
+    const statsData = {
+      p1: { U: 0, M: 0, D: 0, total: p1Subs.length },
+      p2: { L: 0, R: 0, total: p2Subs.length },
+    };
+    p1Subs.forEach(([_, v]) => { if (statsData.p1[v.choice] !== undefined) statsData.p1[v.choice]++; });
+    p2Subs.forEach(([_, v]) => { if (statsData.p2[v.choice] !== undefined) statsData.p2[v.choice]++; });
+
+    // Match: pair each player with a random opponent
+    const playerResults = {};
+    // Match all P1 players
+    for (const [p1Id, p1Data] of p1Subs) {
+      const randP2 = p2Subs[Math.floor(Math.random() * p2Subs.length)];
+      const key = `${p1Data.choice},${randP2[1].choice}`;
+      const pay = NASH.PAYOFFS[key];
+      playerResults[p1Id] = {
+        myChoice: p1Data.choice, oppChoice: randP2[1].choice,
+        oppName: randP2[1].name, myPayoff: pay.p1, oppPayoff: pay.p2, myRole: "P1",
+      };
+    }
+    // Match all P2 players
+    for (const [p2Id, p2Data] of p2Subs) {
+      const randP1 = p1Subs[Math.floor(Math.random() * p1Subs.length)];
+      const key = `${randP1[1].choice},${p2Data.choice}`;
+      const pay = NASH.PAYOFFS[key];
+      playerResults[p2Id] = {
+        myChoice: p2Data.choice, oppChoice: randP1[1].choice,
+        oppName: randP1[1].name, myPayoff: pay.p2, oppPayoff: pay.p1, myRole: "P2",
+      };
+    }
+
+    // Write results
+    const updates = {};
+    updates[`games/nash_game/rounds/${nashRound}/playerResults`] = playerResults;
+    updates[`games/nash_game/rounds/${nashRound}/stats`] = statsData;
+    updates["games/nash_game/state/phase"] = "results";
+    await db.ref().update(updates);
+
+    await loadNashAllStats();
+    alert(`✅ Round ${nashRound} matched! P1: ${p1Subs.length}, P2: ${p2Subs.length}`);
+  };
+
+  const nashNextRound = async () => {
+    await nashStartRound(nashRound + 1);
+  };
+
+  const nashResetGame = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("确认重置纳什博弈？输入 reset\nReset Nash Game? Type 'reset':");
+    if (pw !== "reset") return;
+    await db.ref("games/nash_game").remove();
+    setNashRole(null);
+    setNashPhase("lobby");
+    setNashRound(0);
+    setNashSubmitted(false);
+    setNashMyResult(null);
+    setNashHistory([]);
+    setNashAllStats([]);
+    setNashSubCounts({ p1: 0, p2: 0 });
+    setNashPlayerCounts({ p1: 0, p2: 0 });
+    // Clear stored nash ID so students get fresh roles
+    try { localStorage.removeItem("gt_nash_id"); } catch {}
+    nashId.current = generateId();
+    try { localStorage.setItem("gt_nash_id", nashId.current); } catch {}
+    alert("✅ 纳什博弈已重置 Nash Game reset!");
+  };
+
+  // ================================================================
+  // GRADE GAME — Human matching (unchanged)
+  // ================================================================
+  const submitHuman = async (myChoice) => {
+    if (!firebaseReady) { alert("Firebase 未配置！"); return; }
+    setChoice(myChoice);
+    setWaiting(true);
+    const myRef = db.ref(`games/${gameId}/pending/${myId.current}`);
+    await myRef.set({
+      name: name || "匿名", studentId: studentId || "",
+      choice: myChoice, timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    let timeLeft = 30;
+    setCountdown(timeLeft);
+    const timer = setInterval(() => { timeLeft--; setCountdown(timeLeft); if (timeLeft <= 0) clearInterval(timer); }, 1000);
+
+    setTimeout(() => {
+      const matchRef = db.ref(`games/${gameId}/matches/${myId.current}`);
+      const onMatch = matchRef.on("value", (snap) => {
+        const match = snap.val();
+        if (!match) return;
+        matchRef.off("value", onMatch);
+        const key = `${myChoice},${match.opponentChoice}`;
+        const po = game.payoffs[key];
+        setResult({ myChoice, oppChoice: match.opponentChoice, oppName: match.opponentName, label: po.label, myPay: po.p1, oppPay: po.p2, key });
+        setWaiting(false); setCountdown(0); setScreen("result");
+        db.ref(`games/${gameId}/results`).push({
+          player: name || "匿名", studentId: studentId || "",
+          choice: myChoice, opponent: match.opponentName, oppChoice: match.opponentChoice,
+          payoff: po.p1, timestamp: firebase.database.ServerValue.TIMESTAMP,
+        });
+      });
+      listenersRef.current.push(() => matchRef.off("value", onMatch));
+    }, 30000);
+
+    setTimeout(async () => {
+      const myMatchSnap = await db.ref(`games/${gameId}/matches/${myId.current}`).once("value");
+      if (myMatchSnap.val()) return;
+      const snap = await db.ref(`games/${gameId}/pending`).once("value");
+      const pending = snap.val();
+      if (!pending) { setWaiting(false); setCountdown(0); alert("没有其他人提交。"); setScreen("play"); setChoice(null); return; }
+      const others = Object.entries(pending).filter(([id]) => id !== myId.current);
+      if (others.length === 0) { myRef.remove(); setWaiting(false); setCountdown(0); alert("没有找到对手。"); setScreen("play"); setChoice(null); return; }
+      const [oppId, oppData] = others[Math.floor(Math.random() * others.length)];
+      const updates = {};
+      updates[`games/${gameId}/pending/${myId.current}`] = null;
+      updates[`games/${gameId}/matches/${myId.current}`] = { opponentChoice: oppData.choice, opponentName: oppData.name };
+      const oppMatchSnap = await db.ref(`games/${gameId}/matches/${oppId}`).once("value");
+      if (!oppMatchSnap.val()) {
+        updates[`games/${gameId}/pending/${oppId}`] = null;
+        updates[`games/${gameId}/matches/${oppId}`] = { opponentChoice: myChoice, opponentName: name || "匿名" };
+      }
+      try { await db.ref().update(updates); } catch (e) { console.log("Match conflict"); }
+    }, 30000);
+  };
+
+  const submitAI = async (myChoice) => {
+    setChoice(myChoice); setWaiting(true);
+    const aiResult = await getClaudeChoice(game, aiHistory);
+    const key = `${myChoice},${aiResult.choice}`;
+    const po = game.payoffs[key];
+    setAiHistory(prev => [...prev, { mine: myChoice, opp: aiResult.choice }]);
+    setResult({ myChoice, oppChoice: aiResult.choice, oppName: "Claude AI", label: po.label, myPay: po.p1, oppPay: po.p2, key, aiReasoningCN: aiResult.reasoningCN, aiReasoningEN: aiResult.reasoningEN });
+    setWaiting(false); setScreen("result");
+  };
+
+  const handleChoice = (c) => { if (mode === "ai") submitAI(c); else submitHuman(c); };
+  const playAgain = () => { myId.current = generateId(); setChoice(null); setResult(null); setScreen("play"); };
+
+  const loadStats = () => {
+    if (!firebaseReady) { setStats({ alpha: 0, beta: 0, results: [] }); return; }
+    db.ref(`games/${gameId}/results`).orderByChild("timestamp").limitToLast(200).once("value", (snap) => {
+      const data = snap.val() || {};
+      const results = Object.values(data).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      setStats({ alpha: results.filter(r => r.choice === "α").length, beta: results.filter(r => r.choice === "β").length, results });
+    });
+  };
+
+  // Beauty Contest functions
+  const submitBeauty = async () => {
+    const num = parseInt(beautyNumber);
+    if (isNaN(num) || num < 0 || num > 100) { alert("请输入0-100的整数"); return; }
+    if (!firebaseReady) return;
+    await db.ref("games/beauty_contest/submissions/" + myId.current).set({
+      name: name || "匿名", studentId: studentId || "", number: num,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setBeautySubmitted(true);
+    setScreen("beauty_wait");
+    const resultsRef = db.ref("games/beauty_contest/results");
+    const onResults = resultsRef.on("value", (snap) => {
+      const res = snap.val();
+      if (!res) return;
+      resultsRef.off("value", onResults);
+      setBeautyResult({ myNumber: num, avg: res.avg, target: res.target, totalPlayers: res.totalPlayers, winner: res.winner, winnerNumber: res.winnerNumber, isWinner: res.winnerStudentId === studentId, allNumbers: res.allNumbers });
+      setScreen("beauty_result");
+    });
+    listenersRef.current.push(() => resultsRef.off("value", onResults));
+  };
+
   const revealBeautyResults = async () => {
     if (!firebaseReady) return;
     const snap = await db.ref("games/beauty_contest/submissions").once("value");
     const subs = snap.val();
-    if (!subs) { alert("没有提交 No submissions yet!"); return; }
-    
+    if (!subs) { alert("没有提交!"); return; }
     const entries = Object.values(subs);
     const numbers = entries.map(e => e.number);
     const avg = numbers.reduce((a, b) => a + b, 0) / numbers.length;
     const target = (2 / 3) * avg;
-    
-    let closest = entries[0];
-    let minDist = Math.abs(entries[0].number - target);
-    entries.forEach(e => {
-      const dist = Math.abs(e.number - target);
-      if (dist < minDist) { minDist = dist; closest = e; }
-    });
-
-    // Write results to Firebase — all students listening will see this
+    let closest = entries[0], minDist = Math.abs(entries[0].number - target);
+    entries.forEach(e => { const dist = Math.abs(e.number - target); if (dist < minDist) { minDist = dist; closest = e; } });
     await db.ref("games/beauty_contest/results").set({
-      avg: avg.toFixed(1), target: target.toFixed(1),
-      totalPlayers: entries.length,
-      winner: closest.name, winnerNumber: closest.number,
-      winnerStudentId: closest.studentId || "",
-      allNumbers: numbers.sort((a, b) => a - b),
-      timestamp: firebase.database.ServerValue.TIMESTAMP,
+      avg: avg.toFixed(1), target: target.toFixed(1), totalPlayers: entries.length,
+      winner: closest.name, winnerNumber: closest.number, winnerStudentId: closest.studentId || "",
+      allNumbers: numbers.sort((a, b) => a - b), timestamp: firebase.database.ServerValue.TIMESTAMP,
     });
-
-    alert(`✅ 结果已发布！Results published!\n\n参与: ${entries.length} players\n平均: ${avg.toFixed(1)}\n目标 2/3: ${target.toFixed(1)}\n获胜: ${closest.name} (${closest.number})`);
+    alert(`✅ Results published! ${entries.length} players, avg=${avg.toFixed(1)}, target=${target.toFixed(1)}`);
   };
 
-  // Teacher: reset beauty contest
   const resetBeautyContest = async () => {
     if (!firebaseReady) return;
-    const pw = prompt("确认清除选美博弈数据？输入 reset 确认\nClear beauty contest? Type 'reset':");
+    const pw = prompt("Type 'reset' to confirm:");
     if (pw !== "reset") return;
     await db.ref("games/beauty_contest").remove();
-    setBeautySubmitted(false);
-    setBeautyResult(null);
-    setBeautyNumber("");
-    setBeautySubCount(0);
-    alert("✅ 选美博弈已重置 Beauty contest reset!");
+    setBeautySubmitted(false); setBeautyResult(null); setBeautyNumber(""); setBeautySubCount(0);
+  };
+
+  // ================================================================
+  // RENDER HELPERS
+  // ================================================================
+  const Box = ({ children, style, ...props }) => (
+    <div style={{ background: C.SURFACE, borderRadius: 14, padding: 16, border: `1px solid ${C.HEADER}25`, ...style }} {...props}>{children}</div>
+  );
+  const Btn = ({ children, primary, style, ...props }) => (
+    <button className="btn-press" style={{
+      padding: "14px 20px", fontSize: 15, fontWeight: 700, border: "none", borderRadius: 12, cursor: "pointer", width: "100%",
+      background: primary ? `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})` : "transparent",
+      color: primary ? "white" : C.TEXT2, border: primary ? "none" : `1px solid ${C.DIM}40`, ...style,
+    }} {...props}>{children}</button>
+  );
+
+  // Nash payoff matrix component
+  const NashMatrix = ({ highlightRole, small }) => {
+    const sz = small ? 11 : 13;
+    const pad = small ? "5px 4px" : "8px 6px";
+    return (
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: sz }}>
+        <thead>
+          <tr>
+            <td style={{ padding: pad, fontWeight: 700, color: C.DIM }}>P1 ╲ P2</td>
+            <td style={{ padding: pad, fontWeight: 700, color: C.TEAL, textAlign: "center" }}>L</td>
+            <td style={{ padding: pad, fontWeight: 700, color: C.TEAL, textAlign: "center" }}>R</td>
+          </tr>
+        </thead>
+        <tbody>
+          {[["U", "1,2", "3,4"], ["M", "4,5", "2,4"], ["D", "5,2", "1,3"]].map(([row, l, r], i) => (
+            <tr key={i}>
+              <td style={{ padding: pad, fontWeight: 700, color: C.AMBER }}>{row}</td>
+              {[l, r].map((cell, j) => {
+                const isNE = row === "U" && j === 1;
+                return (
+                  <td key={j} style={{
+                    padding: pad, textAlign: "center",
+                    background: isNE ? `${C.TEAL}18` : "transparent",
+                    borderRadius: 4, color: C.TEXT,
+                    border: isNE ? `1px solid ${C.TEAL}40` : "1px solid transparent",
+                  }}>{cell}</td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    );
+  };
+
+  // Convergence chart SVG
+  const ConvergenceChart = ({ allStats }) => {
+    if (allStats.length === 0) return <div style={{ fontSize: 12, color: C.DIM, textAlign: "center", padding: 20 }}>暂无数据 No data yet</div>;
+    const W = 320, H = 160, PAD = 36, PADR = 16;
+    const maxR = Math.max(...allStats.map(s => s.round), 1);
+    const xScale = (r) => PAD + (r - 1) / Math.max(maxR - 1, 1) * (W - PAD - PADR);
+    const yScale = (pct) => H - PAD - (pct / 100) * (H - PAD - 12);
+
+    const uLine = allStats.map(s => {
+      const total = (s.p1?.total || s.p1?.U + s.p1?.M + s.p1?.D) || 1;
+      const pct = ((s.p1?.U || 0) / total) * 100;
+      return { x: xScale(s.round), y: yScale(pct), pct };
+    });
+    const rLine = allStats.map(s => {
+      const total = (s.p2?.total || s.p2?.L + s.p2?.R) || 1;
+      const pct = ((s.p2?.R || 0) / total) * 100;
+      return { x: xScale(s.round), y: yScale(pct), pct };
+    });
+
+    const pathStr = (pts) => pts.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+
+    return (
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", maxWidth: 360 }}>
+        {/* Grid */}
+        {[0, 25, 50, 75, 100].map(v => (
+          <g key={v}>
+            <line x1={PAD} y1={yScale(v)} x2={W - PADR} y2={yScale(v)} stroke={`${C.DIM}25`} strokeWidth="0.5" />
+            <text x={PAD - 4} y={yScale(v) + 3} textAnchor="end" fontSize="8" fill={C.DIM}>{v}%</text>
+          </g>
+        ))}
+        {/* 100% target line */}
+        <line x1={PAD} y1={yScale(100)} x2={W - PADR} y2={yScale(100)} stroke={`${C.TEAL}30`} strokeWidth="1" strokeDasharray="4,3" />
+        {/* Lines */}
+        {uLine.length > 1 && <path d={pathStr(uLine)} fill="none" stroke={C.AMBER} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />}
+        {rLine.length > 1 && <path d={pathStr(rLine)} fill="none" stroke={C.TEAL} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />}
+        {/* Dots */}
+        {uLine.map((p, i) => <circle key={`u${i}`} cx={p.x} cy={p.y} r="4" fill={C.AMBER} />)}
+        {rLine.map((p, i) => <circle key={`r${i}`} cx={p.x} cy={p.y} r="4" fill={C.TEAL} />)}
+        {/* Labels on last dot */}
+        {uLine.length > 0 && <text x={uLine[uLine.length-1].x + 6} y={uLine[uLine.length-1].y + 3} fontSize="9" fontWeight="700" fill={C.AMBER}>{Math.round(uLine[uLine.length-1].pct)}%</text>}
+        {rLine.length > 0 && <text x={rLine[rLine.length-1].x + 6} y={rLine[rLine.length-1].y + 3} fontSize="9" fontWeight="700" fill={C.TEAL}>{Math.round(rLine[rLine.length-1].pct)}%</text>}
+        {/* X axis labels */}
+        {allStats.map((s, i) => (
+          <text key={i} x={xScale(s.round)} y={H - 8} textAnchor="middle" fontSize="9" fill={C.DIM}>R{s.round}</text>
+        ))}
+        {/* Legend */}
+        <circle cx={PAD + 4} cy={8} r="3.5" fill={C.AMBER} />
+        <text x={PAD + 12} y={11} fontSize="8" fill={C.AMBER} fontWeight="600">P1 chose U</text>
+        <circle cx={PAD + 80} cy={8} r="3.5" fill={C.TEAL} />
+        <text x={PAD + 88} y={11} fontSize="8" fill={C.TEAL} fontWeight="600">P2 chose R</text>
+      </svg>
+    );
   };
 
   // ================================================================
@@ -557,63 +753,61 @@ function App() {
   if (screen === "home") return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG} 0%, #0F1A30 50%, #141E35 100%)` }}>
       <div style={{ position: "absolute", inset: 0, backgroundImage: `linear-gradient(${C.HEADER}08 1px, transparent 1px), linear-gradient(90deg, ${C.HEADER}08 1px, transparent 1px)`, backgroundSize: "40px 40px", pointerEvents: "none" }} />
-
       <div className="fade-up" style={{ position: "relative", zIndex: 1, textAlign: "center", maxWidth: 400, width: "100%" }}>
-        <div style={{ width: 60, height: 60, margin: "0 auto 16px", background: `linear-gradient(135deg, ${C.RED}, ${C.GOLD})`, borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, fontWeight: 800, color: "white", boxShadow: `0 8px 32px ${C.RED}40` }}>
-          GT
-        </div>
-
+        <div style={{ width: 60, height: 60, margin: "0 auto 16px", background: `linear-gradient(135deg, ${C.RED}, ${C.GOLD})`, borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, fontWeight: 800, color: "white", boxShadow: `0 8px 32px ${C.RED}40` }}>GT</div>
         <h1 style={{ fontSize: 28, fontWeight: 800, color: C.TEXT, letterSpacing: "-0.02em" }}>Game Theory Lab</h1>
-        <p style={{ fontSize: 13, color: C.GOLD, letterSpacing: "0.15em", textTransform: "uppercase", fontWeight: 600, margin: "4px 0 0" }}>
-          ECON2501 · 博弈论实验室
-        </p>
+        <p style={{ fontSize: 13, color: C.GOLD, letterSpacing: "0.15em", textTransform: "uppercase", fontWeight: 600, margin: "4px 0 0" }}>ECON2501 · 博弈论实验室</p>
         <p style={{ fontSize: 12, color: C.DIM, margin: "8px 0 28px" }}></p>
 
         {!firebaseReady && (
           <div style={{ background: `${C.RED}15`, border: `1px solid ${C.RED}40`, borderRadius: 10, padding: 12, marginBottom: 16, fontSize: 12, color: "#FF8A80", textAlign: "left" }}>
-            ⚠️ Firebase 未配置。人人对战模式不可用。<br/>请按 index.html 顶部说明配置 Firebase。<br/>AI 对战模式可正常使用。
+            ⚠️ Firebase 未配置。人人对战模式不可用。
           </div>
         )}
 
-        <input type="text" placeholder="你的名字 / Your name" value={name}
-          onChange={e => setName(e.target.value)}
+        <input type="text" placeholder="你的名字 / Your name" value={name} onChange={e => setName(e.target.value)}
           style={{ width: "100%", padding: "13px 16px", fontSize: 15, background: C.SURFACE, border: `1px solid ${C.HEADER}40`, borderRadius: 11, color: C.TEXT, outline: "none", marginBottom: 10 }}
-          onFocus={e => e.target.style.borderColor = C.GOLD}
-          onBlur={e => e.target.style.borderColor = `${C.HEADER}40`}
-        />
-        <input type="text" placeholder="学号 / Student ID" value={studentId}
-          onChange={e => setStudentId(e.target.value)}
+          onFocus={e => e.target.style.borderColor = C.GOLD} onBlur={e => e.target.style.borderColor = `${C.HEADER}40`} />
+        <input type="text" placeholder="学号 / Student ID" value={studentId} onChange={e => setStudentId(e.target.value)}
           style={{ width: "100%", padding: "13px 16px", fontSize: 15, background: C.SURFACE, border: `1px solid ${C.HEADER}40`, borderRadius: 11, color: C.TEXT, outline: "none", marginBottom: 16 }}
-          onFocus={e => e.target.style.borderColor = C.GOLD}
-          onBlur={e => e.target.style.borderColor = `${C.HEADER}40`}
-        />
+          onFocus={e => e.target.style.borderColor = C.GOLD} onBlur={e => e.target.style.borderColor = `${C.HEADER}40`} />
 
-        <div style={{ marginBottom: 12, display: "flex", gap: 10 }}>
+        {/* Three game buttons */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
           <button className="btn-press" onClick={() => {
-            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
+            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
             setGameId("grade_game"); setMode("human"); setScreen("intro");
           }}
-            style={{ flex: 1, padding: "16px 10px", fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
+            style={{ flex: 1, padding: "14px 6px", fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.BLUE}50` }}
             disabled={!firebaseReady}>
-            <div style={{ fontSize: 20, marginBottom: 2 }}>🎮</div>
-            成绩博弈<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>Grade Game</span>
+            <div style={{ fontSize: 18, marginBottom: 2 }}>📝</div>
+            成绩博弈<br/><span style={{ fontSize: 9, opacity: 0.6, fontWeight: 400 }}>Grade Game</span>
           </button>
           <button className="btn-press" onClick={() => {
-            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号\nPlease fill in name and student ID"); return; }
+            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
             setScreen("beauty_intro");
           }}
-            style={{ flex: 1, padding: "16px 10px", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg, #2D1B4E, #1B1040)", border: `1px solid #4A307060`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: "0 4px 20px #2D1B4E50" }}
+            style={{ flex: 1, padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #2D1B4E, #1B1040)", border: `1px solid #4A307060`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: "0 4px 20px #2D1B4E50" }}
             disabled={!firebaseReady}>
-            <div style={{ fontSize: 20, marginBottom: 2 }}>🏆</div>
-            选美博弈<br/><span style={{ fontSize: 10, opacity: 0.6, fontWeight: 400 }}>P-Beauty Contest</span>
+            <div style={{ fontSize: 18, marginBottom: 2 }}>🏆</div>
+            选美博弈<br/><span style={{ fontSize: 9, opacity: 0.6, fontWeight: 400 }}>Beauty Contest</span>
+          </button>
+          <button className="btn-press" onClick={() => {
+            if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
+            joinNashGame();
+          }}
+            style={{ flex: 1, padding: "14px 6px", fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, ${C.TEAL_DARK}, #0A1F1E)`, border: `1px solid ${C.TEAL}35`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.TEAL}25` }}
+            disabled={!firebaseReady}>
+            <div style={{ fontSize: 18, marginBottom: 2 }}>⚖️</div>
+            纳什博弈<br/><span style={{ fontSize: 9, opacity: 0.6, fontWeight: 400 }}>Nash Game</span>
           </button>
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn-press" onClick={() => {
-            const pw = prompt("请输入教师密码 / Enter teacher password:");
-            if (pw === "econ2501") { loadStats(); setScreen("teacher"); }
-            else if (pw !== null) alert("密码错误 / Wrong password");
+            const pw = prompt("请输入教师密码:");
+            if (pw === "econ2501") { loadStats(); loadNashAllStats(); setScreen("teacher"); }
+            else if (pw !== null) alert("密码错误");
           }}
             style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}35`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
             🎓 教师面板
@@ -627,31 +821,24 @@ function App() {
     </div>
   );
 
-  // ---- INTRO (Game Description) ----
+  // ---- GRADE GAME INTRO ----
   if (screen === "intro") {
     const intro = game.intro;
     return (
       <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG} 0%, #0F1A30 100%)`, overflowY: "auto" }}>
-        <button className="btn-press" onClick={() => setScreen("home")}
-          style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", zIndex: 10 }}>← Back 返回</button>
-
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", zIndex: 10 }}>← Back 返回</button>
         <div style={{ maxWidth: 420, width: "100%", paddingTop: 30 }}>
-          {/* Header */}
           <div className="fade-up" style={{ textAlign: "center", marginBottom: 20 }}>
             <div style={{ fontSize: 48, marginBottom: 6 }}>{intro.emoji}</div>
             <div style={{ fontSize: 11, color: C.GOLD, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>Week {game.week}</div>
             <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 2 }}>{game.nameCN}</h2>
             <p style={{ fontSize: 14, color: C.TEXT2 }}>{game.name}</p>
           </div>
-
-          {/* Story */}
           <div className="fade-up fade-up-1" style={{ background: C.SURFACE, borderRadius: 14, padding: 16, border: `1px solid ${C.HEADER}25`, marginBottom: 14 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>📖 故事背景 Story</div>
             <p style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.7, marginBottom: 8 }}>{intro.story}</p>
             <p style={{ fontSize: 11, color: C.DIM, lineHeight: 1.5, fontStyle: "italic" }}>{intro.storySub}</p>
           </div>
-
-          {/* Rules */}
           <div className="fade-up fade-up-2" style={{ background: C.SURFACE, borderRadius: 14, padding: 16, border: `1px solid ${C.HEADER}25`, marginBottom: 14 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>📋 游戏规则 Game Rules</div>
             {intro.rules.map((r, i) => (
@@ -665,219 +852,106 @@ function App() {
               </div>
             ))}
           </div>
-
-          {/* AI info (if AI mode) */}
-          {mode === "ai" && (
-            <div className="fade-up fade-up-3" style={{ background: "linear-gradient(135deg, #1A1035, #2A1A40)", borderRadius: 14, padding: 16, border: `1px solid #4A307050`, marginBottom: 14, display: "flex", alignItems: "center", gap: 14 }}>
-              <div style={{ width: 48, height: 48, borderRadius: 12, background: "linear-gradient(135deg, #D4A84B, #C00000)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0 }}>🤖</div>
-              <div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: C.PURPLE }}>Claude AI</div>
-                <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.5 }}>你的对手是AI。它会分析博弈结构和你的历史选择，做出策略性决定。<br/><span style={{ color: C.DIM }}>Your opponent is an AI that analyzes the game and your history.</span></div>
-              </div>
-            </div>
-          )}
-
-          {/* Start button */}
           <button className="btn-press" onClick={() => setScreen("play")}
-            style={{
-              width: "100%", padding: "16px", fontSize: 16, fontWeight: 700,
-              background: mode === "ai" ? "linear-gradient(135deg, #2D1B4E, #4A3070)" : `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`,
-              border: "none", borderRadius: 12, color: "white", cursor: "pointer",
-              boxShadow: `0 4px 24px ${mode === "ai" ? "#2D1B4E" : C.BLUE}50`,
-              marginBottom: 30,
-            }}>
-            {mode === "ai" ? `⚔️ 开始对战 AI` : `👥 开始匹配对手`}
+            style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 700, background: `linear-gradient(135deg, ${C.HEADER}, ${C.BLUE})`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", boxShadow: `0 4px 24px ${C.BLUE}50`, marginBottom: 30 }}>
+            👥 开始匹配对手
           </button>
         </div>
       </div>
     );
   }
 
-  // ---- PLAY ----
+  // ---- GRADE GAME PLAY ----
   if (screen === "play") return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG} 0%, #0F1A30 100%)` }}>
-      <button className="btn-press" onClick={() => { setScreen("home"); setWaiting(false); setChoice(null); }}
-        style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← 返回</button>
-
+      <button className="btn-press" onClick={() => { setScreen("home"); setWaiting(false); setChoice(null); }} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← 返回</button>
       <div style={{ maxWidth: 400, width: "100%", textAlign: "center" }}>
-        <p style={{ fontSize: 11, color: C.GOLD, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
-          {game.nameCN} · Week {game.week}
-        </p>
-
+        <p style={{ fontSize: 11, color: C.GOLD, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>{game.nameCN} · Week {game.week}</p>
         {!waiting ? (
           <div className="fade-up">
             <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>选择你的策略 Make Your Choice</h2>
-            <p style={{ fontSize: 12, color: C.TEXT2, marginBottom: 6 }}>
-              {mode === "ai" ? "对战 Claude AI" : "对战真人 Random anonymous matching"}
-            </p>
             <p style={{ fontSize: 12, color: C.DIM, marginBottom: 20 }}>{game.descCN}</p>
-
-            {/* Payoff matrix toggle */}
             <div style={{ marginBottom: 20 }}>
               <button className="btn-press" onClick={() => setShowMatrix(!showMatrix)}
                 style={{ fontSize: 11, color: C.DIM, background: "none", border: `1px solid ${C.DIM}25`, borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}>
-                {showMatrix ? "▲ 隐藏 Hide" : "▼ 收益矩阵 Payoff Matrix"}
+                {showMatrix ? "▲ 隐藏" : "▼ 收益矩阵 Payoff Matrix"}
               </button>
               {showMatrix && (
                 <div style={{ marginTop: 10, background: C.SURFACE, borderRadius: 10, padding: 12, border: `1px solid ${C.HEADER}25` }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                     {game.matrix.map((row, i) => (
-                      <tr key={i}>
-                        {row.map((cell, j) => (
-                          <td key={j} style={{
-                            padding: "8px 6px", textAlign: "center",
-                            fontWeight: i === 0 || j === 0 ? 700 : 400,
-                            color: i === 0 || j === 0 ? C.GOLD : C.TEXT,
-                            background: (i === 1 && j === 1) ? `${C.RED}12` : (i === 2 && j === 2) ? `${C.GOLD}12` : "transparent",
-                            borderRadius: 4,
-                          }}>{cell}</td>
-                        ))}
-                      </tr>
+                      <tr key={i}>{row.map((cell, j) => (
+                        <td key={j} style={{ padding: "8px 6px", textAlign: "center", fontWeight: i === 0 || j === 0 ? 700 : 400, color: i === 0 || j === 0 ? C.GOLD : C.TEXT, background: (i === 1 && j === 1) ? `${C.RED}12` : (i === 2 && j === 2) ? `${C.GOLD}12` : "transparent", borderRadius: 4 }}>{cell}</td>
+                      ))}</tr>
                     ))}
                   </table>
-                  <p style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>Format: your grade, their grade</p>
                 </div>
               )}
             </div>
-
-            {/* Strategy buttons */}
             <div style={{ display: "flex", gap: 16, justifyContent: "center" }}>
               {game.strategies.map(strat => (
                 <button key={strat} className="btn-press" onClick={() => handleChoice(strat)}
-                  style={{
-                    width: 130, height: 150, fontSize: 44, fontWeight: 800,
-                    background: strat === "α" ? `linear-gradient(145deg, ${C.ALPHA_BG}, #0F2040)` : `linear-gradient(145deg, ${C.BETA_BG}, #1A1035)`,
-                    border: `2px solid ${strat === "α" ? C.HEADER : "#4A3070"}`,
-                    borderRadius: 18, color: strat === "α" ? C.ALPHA_C : C.BETA_C,
-                    cursor: "pointer", display: "flex", flexDirection: "column",
-                    alignItems: "center", justifyContent: "center",
-                    boxShadow: `0 6px 24px ${strat === "α" ? C.BLUE : "#2D1B4E"}35`,
-                  }}>
-                  {strat}
-                  <div style={{ fontSize: 11, fontWeight: 400, marginTop: 6, opacity: 0.5, color: C.TEXT2 }}>
-                    {strat === "α" ? "Alpha" : "Beta"}
-                  </div>
+                  style={{ width: 130, height: 150, fontSize: 44, fontWeight: 800, background: strat === "α" ? `linear-gradient(145deg, ${C.ALPHA_BG}, #0F2040)` : `linear-gradient(145deg, ${C.BETA_BG}, #1A1035)`, border: `2px solid ${strat === "α" ? C.HEADER : "#4A3070"}`, borderRadius: 18, color: strat === "α" ? C.ALPHA_C : C.BETA_C, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: `0 6px 24px ${strat === "α" ? C.BLUE : "#2D1B4E"}35` }}>
+                  {strat}<div style={{ fontSize: 11, fontWeight: 400, marginTop: 6, opacity: 0.5, color: C.TEXT2 }}>{strat === "α" ? "Alpha" : "Beta"}</div>
                 </button>
               ))}
             </div>
           </div>
         ) : (
           <div className="fade-up" style={{ padding: 40 }}>
-            {/* Countdown circle */}
             <div style={{ position: "relative", width: 80, height: 80, margin: "0 auto 16px" }}>
               <svg width="80" height="80" style={{ transform: "rotate(-90deg)" }}>
                 <circle cx="40" cy="40" r="34" fill="none" stroke={`${C.DIM}25`} strokeWidth="4" />
-                <circle cx="40" cy="40" r="34" fill="none" stroke={C.GOLD} strokeWidth="4"
-                  strokeDasharray={`${2 * Math.PI * 34}`}
-                  strokeDashoffset={`${2 * Math.PI * 34 * (1 - countdown / 30)}`}
-                  strokeLinecap="round"
-                  style={{ transition: "stroke-dashoffset 1s linear" }} />
+                <circle cx="40" cy="40" r="34" fill="none" stroke={C.GOLD} strokeWidth="4" strokeDasharray={`${2*Math.PI*34}`} strokeDashoffset={`${2*Math.PI*34*(1-countdown/30)}`} strokeLinecap="round" style={{ transition: "stroke-dashoffset 1s linear" }} />
               </svg>
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 800, color: C.GOLD }}>
-                {countdown}
-              </div>
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 800, color: C.GOLD }}>{countdown}</div>
             </div>
-
-            <h2 style={{ fontSize: 18, color: C.TEXT, marginBottom: 6 }}>
-              等待同学们提交... Waiting for classmates...
-            </h2>
-            <p style={{ fontSize: 12, color: C.DIM }}>
-              {countdown > 0 ? `${countdown} 秒后随机配对 / Matching in ${countdown}s` : "Matching now... 正在配对中..."}
-            </p>
-            <p style={{ fontSize: 14, color: C.TEXT2, marginTop: 12 }}>
-              你选择了 <strong style={{ color: choice === "α" ? C.ALPHA_C : C.BETA_C, fontSize: 18 }}>{choice}</strong>
-            </p>
-            <p style={{ fontSize: 11, color: C.DIM, marginTop: 8 }}>
-              ✓ 已提交 Submitted — 请等待 Please wait
-            </p>
+            <h2 style={{ fontSize: 18, color: C.TEXT, marginBottom: 6 }}>等待同学们提交...</h2>
+            <p style={{ fontSize: 12, color: C.DIM }}>{countdown > 0 ? `${countdown}s` : "Matching..."}</p>
+            <p style={{ fontSize: 14, color: C.TEXT2, marginTop: 12 }}>你选择了 <strong style={{ color: choice === "α" ? C.ALPHA_C : C.BETA_C, fontSize: 18 }}>{choice}</strong></p>
           </div>
         )}
       </div>
     </div>
   );
 
-  // ---- RESULT ----
+  // ---- GRADE GAME RESULT ----
   if (screen === "result" && result) {
     const win = result.myPay > result.oppPay;
     const tie = result.myPay === result.oppPay;
-
     return (
       <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: win ? `linear-gradient(165deg, #0B200F, #0F1A30)` : tie ? `linear-gradient(165deg, #1A1A0B, #0F1A30)` : `linear-gradient(165deg, #200B0B, #0F1A30)` }}>
         <div style={{ maxWidth: 400, width: "100%", textAlign: "center" }}>
-
-          <div className="fade-up" style={{ fontSize: 44, marginBottom: 4 }}>
-            {win ? "🎉" : tie ? "🤝" : "😤"}
-          </div>
-          <h2 className="fade-up fade-up-1" style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 2 }}>
-            {result.label}
-          </h2>
-          <p className="fade-up fade-up-1" style={{ fontSize: 12, color: C.TEXT2, marginBottom: 20 }}>
-            vs {result.oppName}
-          </p>
-
-          {/* Cards */}
+          <div className="fade-up" style={{ fontSize: 44, marginBottom: 4 }}>{win ? "🎉" : tie ? "🤝" : "😤"}</div>
+          <h2 className="fade-up fade-up-1" style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 2 }}>{result.label}</h2>
+          <p className="fade-up fade-up-1" style={{ fontSize: 12, color: C.TEXT2, marginBottom: 20 }}>vs {result.oppName}</p>
           <div className="fade-up fade-up-2" style={{ display: "flex", gap: 12, marginBottom: 20 }}>
             <Box style={{ flex: 1, textAlign: "center" }}>
               <div style={{ fontSize: 10, color: C.DIM, marginBottom: 2 }}>你的选择</div>
               <div style={{ fontSize: 32, fontWeight: 800, color: result.myChoice === "α" ? C.ALPHA_C : C.BETA_C }}>{result.myChoice}</div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: result.myPay >= 0 ? C.GREEN : C.RED, marginTop: 2 }}>
-                {result.myPay > 0 ? "+" : ""}{result.myPay}
-              </div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: result.myPay >= 0 ? C.GREEN : C.RED, marginTop: 2 }}>{result.myPay > 0 ? "+" : ""}{result.myPay}</div>
             </Box>
             <Box style={{ flex: 1, textAlign: "center" }}>
               <div style={{ fontSize: 10, color: C.DIM, marginBottom: 2 }}>对方选择</div>
               <div style={{ fontSize: 32, fontWeight: 800, color: result.oppChoice === "α" ? C.ALPHA_C : C.BETA_C }}>{result.oppChoice}</div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: result.oppPay >= 0 ? C.GREEN : C.RED, marginTop: 2 }}>
-                {result.oppPay > 0 ? "+" : ""}{result.oppPay}
-              </div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: result.oppPay >= 0 ? C.GREEN : C.RED, marginTop: 2 }}>{result.oppPay > 0 ? "+" : ""}{result.oppPay}</div>
             </Box>
           </div>
-
-          {/* Lesson */}
           <div className="fade-up fade-up-3" style={{ background: `${C.GOLD}0C`, border: `1px solid ${C.GOLD}25`, borderRadius: 12, padding: 14, marginBottom: 14, textAlign: "left" }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 4 }}>
-              💡 {game.lessonTitle}
-            </div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 4 }}>💡 {game.lessonTitle}</div>
             <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.65 }}>
               {game.lessons[result.key].split("\n\n").map((para, i) => (
                 <p key={i} style={{ margin: i === 0 ? "0 0 8px" : "0", color: i === 0 ? C.TEXT2 : C.DIM, fontStyle: i === 0 ? "normal" : "italic" }}>{para}</p>
               ))}
             </div>
           </div>
-
-          {/* Claude AI Reasoning */}
           {result.aiReasoningCN && (
             <div className="fade-up fade-up-3" style={{ background: "linear-gradient(135deg, #1A1035, #1F1540)", border: "1px solid #4A307040", borderRadius: 12, padding: 14, marginBottom: 14, textAlign: "left" }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ display: "inline-flex", width: 20, height: 20, borderRadius: 5, background: "linear-gradient(135deg, #D4A84B, #C00000)", alignItems: "center", justifyContent: "center", fontSize: 10 }}>🤖</span>
-                Claude AI 的思考过程 Claude's Reasoning
-              </div>
-              <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7, marginBottom: 8 }}>
-                {result.aiReasoningCN}
-              </div>
-              <div style={{ fontSize: 11, color: C.DIM, lineHeight: 1.6, fontStyle: "italic", borderTop: `1px solid ${C.DIM}15`, paddingTop: 8 }}>
-                {result.aiReasoningEN}
-              </div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 8 }}>🤖 Claude AI 的思考过程</div>
+              <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7, marginBottom: 8 }}>{result.aiReasoningCN}</div>
+              <div style={{ fontSize: 11, color: C.DIM, lineHeight: 1.6, fontStyle: "italic", borderTop: `1px solid ${C.DIM}15`, paddingTop: 8 }}>{result.aiReasoningEN}</div>
             </div>
           )}
-
-          {/* AI history */}
-          {mode === "ai" && aiHistory.length > 1 && (
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>对战记录 History ({aiHistory.length} 局 rounds)</div>
-              <div style={{ display: "flex", gap: 3, justifyContent: "center", flexWrap: "wrap" }}>
-                {aiHistory.map((h, i) => (
-                  <div key={i} style={{
-                    width: 28, height: 28, borderRadius: 6, fontSize: 10, fontWeight: 700,
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    background: h.mine === "α" && h.opp === "α" ? `${C.RED}20` : h.mine === "β" && h.opp === "β" ? `${C.GREEN}20` : `${C.GOLD}15`,
-                    color: h.mine === "α" && h.opp === "α" ? C.RED : h.mine === "β" && h.opp === "β" ? C.GREEN : C.GOLD,
-                  }}>{h.mine}{h.opp}</div>
-                ))}
-              </div>
-            </div>
-          )}
-
           <div style={{ display: "flex", gap: 10 }}>
             <Btn primary onClick={playAgain}>再来一局 Play Again</Btn>
             <Btn onClick={() => { setChoice(null); setResult(null); setScreen("home"); }}>返回首页 Home</Btn>
@@ -887,40 +961,24 @@ function App() {
     );
   }
 
-  // ---- P-BEAUTY CONTEST SCREENS ----
-
+  // ---- BEAUTY CONTEST SCREENS (unchanged) ----
   if (screen === "beauty_intro") return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
       <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
-        <button className="btn-press" onClick={() => setScreen("home")}
-          style={{ position: "absolute", top: 16, left: 16, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back 返回</button>
-
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "absolute", top: 16, left: 16, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back 返回</button>
         <div style={{ fontSize: 50, marginBottom: 12 }}>🏆</div>
         <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>P-Beauty Contest</h2>
         <p style={{ fontSize: 14, color: C.PURPLE, marginBottom: 20 }}>选美博弈</p>
-
         <div style={{ background: C.SURFACE, borderRadius: 14, padding: 18, textAlign: "left", marginBottom: 16, border: `1px solid ${C.PURPLE}30` }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: C.PURPLE, marginBottom: 10 }}>📋 Rules 规则</div>
           <div style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.7 }}>
             <p style={{ marginBottom: 8 }}>① 每人选一个 <strong>0到100</strong> 之间的整数</p>
-            <p style={{ marginBottom: 8, color: C.DIM, fontSize: 12 }}>Each player picks an integer from 0 to 100.</p>
             <p style={{ marginBottom: 8 }}>② 计算所有人提交数字的 <strong>平均值</strong></p>
-            <p style={{ marginBottom: 8, color: C.DIM, fontSize: 12 }}>Compute the average of all submitted numbers.</p>
-            <p style={{ marginBottom: 8 }}>③ 最接近平均值 <strong>2/3</strong> 的人获胜 🏆</p>
-            <p style={{ color: C.DIM, fontSize: 12 }}>The winner is the player closest to 2/3 of the average.</p>
+            <p>③ 最接近平均值 <strong>2/3</strong> 的人获胜 🏆</p>
           </div>
         </div>
-
-        <div style={{ background: `${C.GOLD}0C`, borderRadius: 12, padding: 12, marginBottom: 16, border: `1px solid ${C.GOLD}25` }}>
-          <div style={{ fontSize: 12, color: C.GOLD }}>💡 Think: 想一想</div>
-          <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.6, marginTop: 4 }}>
-            What do you believe others will choose?<br/>
-            What is your best response to that belief?
-          </div>
-        </div>
-
         <button className="btn-press" onClick={() => setScreen("beauty_play")}
-          style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer", boxShadow: "0 4px 20px #4A307050" }}>
+          style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer" }}>
           开始 Let's Play!
         </button>
       </div>
@@ -930,20 +988,12 @@ function App() {
   if (screen === "beauty_play") return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
       <div style={{ maxWidth: 400, width: "100%", textAlign: "center" }}>
-        <button className="btn-press" onClick={() => setScreen("beauty_intro")}
-          style={{ position: "absolute", top: 16, left: 16, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back 返回</button>
-
+        <button className="btn-press" onClick={() => setScreen("beauty_intro")} style={{ position: "absolute", top: 16, left: 16, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
         <div style={{ fontSize: 42, marginBottom: 8 }}>🎯</div>
         <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>选择你的数字</h2>
         <p style={{ fontSize: 12, color: C.DIM, marginBottom: 24 }}>Pick your number (0-100)</p>
-
-        <input type="number" min="0" max="100" placeholder="0 - 100" value={beautyNumber}
-          onChange={e => setBeautyNumber(e.target.value)}
-          style={{ width: "100%", padding: "20px 16px", fontSize: 32, fontWeight: 800, background: C.SURFACE, border: `2px solid ${C.PURPLE}50`, borderRadius: 14, color: C.TEXT, outline: "none", textAlign: "center", marginBottom: 16 }}
-          onFocus={e => e.target.style.borderColor = C.PURPLE}
-          onBlur={e => e.target.style.borderColor = `${C.PURPLE}50`}
-        />
-
+        <input type="number" min="0" max="100" placeholder="0 - 100" value={beautyNumber} onChange={e => setBeautyNumber(e.target.value)}
+          style={{ width: "100%", padding: "20px 16px", fontSize: 32, fontWeight: 800, background: C.SURFACE, border: `2px solid ${C.PURPLE}50`, borderRadius: 14, color: C.TEXT, outline: "none", textAlign: "center", marginBottom: 16 }} />
         <button className="btn-press" onClick={submitBeauty}
           style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer" }}>
           提交 Submit
@@ -956,20 +1006,12 @@ function App() {
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
       <div style={{ textAlign: "center" }}>
         <div style={{ width: 60, height: 60, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.PURPLE, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-
-        <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待老师揭晓结果...</h2>
-        <p style={{ fontSize: 13, color: C.DIM, marginBottom: 16 }}>Submitted! Waiting for teacher to reveal results...</p>
-        
-        <p style={{ fontSize: 18, color: C.PURPLE, fontWeight: 700, marginBottom: 8 }}>
-          你选了 You chose: <span style={{ fontSize: 32, color: C.TEXT }}>{beautyNumber}</span>
-        </p>
-        
+        <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待老师揭晓...</h2>
+        <p style={{ fontSize: 18, color: C.PURPLE, fontWeight: 700, marginTop: 12 }}>你选了: <span style={{ fontSize: 32, color: C.TEXT }}>{beautyNumber}</span></p>
         <div style={{ background: C.SURFACE, borderRadius: 10, padding: 12, marginTop: 16, border: `1px solid ${C.DIM}20` }}>
-          <div style={{ fontSize: 12, color: C.DIM }}>已提交人数 Submissions so far</div>
+          <div style={{ fontSize: 12, color: C.DIM }}>已提交人数</div>
           <div style={{ fontSize: 28, fontWeight: 800, color: C.PURPLE }}>{beautySubCount}</div>
         </div>
-
-        <p style={{ fontSize: 11, color: C.DIM, marginTop: 12 }}>✓ 已提交 Submitted — 请不要关闭此页面 Don't close this page</p>
       </div>
     </div>
   );
@@ -978,195 +1020,454 @@ function App() {
     <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1035)` }}>
       <div style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
         <div style={{ fontSize: 42, marginBottom: 8 }}>{beautyResult.isWinner ? "🎉" : "📊"}</div>
-        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>
-          {beautyResult.isWinner ? "你赢了！You Won!" : "Results 结果"}
-        </h2>
-
+        <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>{beautyResult.isWinner ? "你赢了！" : "Results 结果"}</h2>
         <div style={{ display: "flex", gap: 10, marginTop: 16, marginBottom: 16 }}>
-          <div style={{ flex: 1, background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.DIM}20` }}>
-            <div style={{ fontSize: 10, color: C.DIM }}>参与人数 Players</div>
-            <div style={{ fontSize: 28, fontWeight: 800, color: C.TEXT }}>{beautyResult.totalPlayers}</div>
-          </div>
-          <div style={{ flex: 1, background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.DIM}20` }}>
-            <div style={{ fontSize: 10, color: C.DIM }}>平均值 Average</div>
-            <div style={{ fontSize: 28, fontWeight: 800, color: C.GOLD }}>{beautyResult.avg}</div>
-          </div>
-          <div style={{ flex: 1, background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.PURPLE}30` }}>
-            <div style={{ fontSize: 10, color: C.DIM }}>目标 2/3 × avg</div>
-            <div style={{ fontSize: 28, fontWeight: 800, color: C.PURPLE }}>{beautyResult.target}</div>
-          </div>
+          {[{ label: "参与人数", val: beautyResult.totalPlayers, color: C.TEXT },
+            { label: "平均值", val: beautyResult.avg, color: C.GOLD },
+            { label: "目标 2/3×avg", val: beautyResult.target, color: C.PURPLE }].map((d, i) => (
+            <div key={i} style={{ flex: 1, background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.DIM}20` }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>{d.label}</div>
+              <div style={{ fontSize: 28, fontWeight: 800, color: d.color }}>{d.val}</div>
+            </div>
+          ))}
         </div>
-
-        <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, marginBottom: 14, border: `1px solid ${C.GOLD}30`, textAlign: "left" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>🏆 Winner 获胜者</div>
-          <div style={{ fontSize: 16, color: C.TEXT }}>{beautyResult.winner} — chose <strong style={{ color: C.PURPLE }}>{beautyResult.winnerNumber}</strong></div>
-          <div style={{ fontSize: 12, color: C.DIM, marginTop: 2 }}>Closest to {beautyResult.target}</div>
-        </div>
-
-        <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, marginBottom: 14, border: `1px solid ${C.DIM}20`, textAlign: "left" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.TEXT2, marginBottom: 6 }}>你的选择 Your choice</div>
-          <div style={{ fontSize: 22, fontWeight: 800, color: C.PURPLE }}>{beautyResult.myNumber}
-            <span style={{ fontSize: 13, color: C.DIM, fontWeight: 400 }}> — distance from target: {Math.abs(beautyResult.myNumber - parseFloat(beautyResult.target)).toFixed(1)}</span>
-          </div>
-        </div>
-
-        <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, marginBottom: 14, border: `1px solid ${C.DIM}20`, textAlign: "left" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.TEXT2, marginBottom: 8 }}>所有提交 All submissions (sorted)</div>
+        <Box style={{ marginBottom: 14, textAlign: "left", border: `1px solid ${C.GOLD}30` }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>🏆 Winner: {beautyResult.winner} — {beautyResult.winnerNumber}</div>
+        </Box>
+        <Box style={{ marginBottom: 14, textAlign: "left" }}>
+          <div style={{ fontSize: 12, color: C.DIM, marginBottom: 8 }}>所有提交 (sorted)</div>
           <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             {beautyResult.allNumbers.map((n, i) => (
-              <div key={i} style={{
-                padding: "4px 8px", borderRadius: 6, fontSize: 12, fontWeight: 600,
-                background: n === beautyResult.myNumber ? `${C.PURPLE}25` : n === beautyResult.winnerNumber ? `${C.GOLD}20` : `${C.DIM}15`,
-                color: n === beautyResult.myNumber ? C.PURPLE : n === beautyResult.winnerNumber ? C.GOLD : C.TEXT2,
-                border: n === beautyResult.winnerNumber ? `1px solid ${C.GOLD}50` : "1px solid transparent",
-              }}>{n}</div>
+              <div key={i} style={{ padding: "4px 8px", borderRadius: 6, fontSize: 12, fontWeight: 600, background: n === beautyResult.myNumber ? `${C.PURPLE}25` : `${C.DIM}15`, color: n === beautyResult.myNumber ? C.PURPLE : C.TEXT2 }}>{n}</div>
             ))}
           </div>
-        </div>
-
-        <div style={{ background: `${C.GOLD}0C`, borderRadius: 12, padding: 12, marginBottom: 14, border: `1px solid ${C.GOLD}25`, textAlign: "left" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 4 }}>💡 Think about it 想一想</div>
-          <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.6 }}>
-            如果每个人都是"理性的"，正确答案应该是什么？我们下周学完迭代消除后再来分析！<br/>
-            <span style={{ color: C.DIM }}>If everyone were "rational", what should the answer be? We'll analyze this formally next week after learning IESDS!</span>
-          </div>
-        </div>
-
+        </Box>
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn-press" onClick={() => { setBeautyNumber(""); setBeautyResult(null); setScreen("beauty_play"); }}
-            style={{ flex: 1, padding: 13, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer" }}>
-            再来一轮 Play Again
-          </button>
-          <button className="btn-press" onClick={() => { setBeautyNumber(""); setBeautyResult(null); setScreen("home"); }}
-            style={{ flex: 1, padding: 13, fontSize: 14, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 12, color: C.TEXT2, cursor: "pointer" }}>
-            返回首页 Home
-          </button>
+            style={{ flex: 1, padding: 13, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 12, color: "white", cursor: "pointer" }}>再来一轮</button>
+          <Btn onClick={() => { setBeautyNumber(""); setBeautyResult(null); setScreen("home"); }}>返回首页</Btn>
         </div>
       </div>
     </div>
   );
 
-  // ---- TEACHER ----
-  if (screen === "teacher") {
-    const total = stats.alpha + stats.beta;
-    const aR = total > 0 ? Math.round(stats.alpha / total * 100) : 0;
-    const bR = total > 0 ? Math.round(stats.beta / total * 100) : 0;
+  // ================================================================
+  // NASH GAME SCREENS
+  // ================================================================
+
+  // ---- NASH LOBBY ----
+  if (screen === "nash_lobby") {
+    const myStrats = nashRole === "P1" ? NASH.P1_STRATS : NASH.P2_STRATS;
+    const isPlaying = nashPhase === "playing" && nashRound > 0;
+    const isResults = nashPhase === "results" && nashRound > 0;
+
+    // Auto-navigate to play/result when teacher changes phase
+    if (isPlaying && !nashSubmitted) return renderNashPlay();
+    if (isPlaying && nashSubmitted) return renderNashWait();
+    if (isResults) return renderNashResult();
 
     return (
-      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #0F1A30)` }}>
-        <div style={{ maxWidth: 460, margin: "0 auto" }}>
-          <button className="btn-press" onClick={() => setScreen("home")} style={{ background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", marginBottom: 14 }}>← 返回</button>
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #0F2420)` }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>⚖️</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>纳什均衡博弈</h2>
+          <p style={{ fontSize: 14, color: C.TEAL, marginBottom: 20 }}>Nash Equilibrium Game · Week 4</p>
 
-          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 2 }}>🎓 教师面板 Teacher Panel</h2>
-          <p style={{ fontSize: 12, color: C.TEXT2, marginBottom: 20 }}>{game.nameCN} · 实时课堂统计 Live Stats</p>
-
-          <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
-            <Box style={{ flex: 1, textAlign: "center" }}>
-              <div style={{ fontSize: 32, fontWeight: 800, color: C.ALPHA_C }}>{aR}%</div>
-              <div style={{ fontSize: 12, color: C.TEXT2 }}>Chose α 选择 α</div>
-              <div style={{ fontSize: 10, color: C.DIM }}>{stats.alpha}/{total} 人</div>
-            </Box>
-            <Box style={{ flex: 1, textAlign: "center" }}>
-              <div style={{ fontSize: 32, fontWeight: 800, color: C.BETA_C }}>{bR}%</div>
-              <div style={{ fontSize: 12, color: C.TEXT2 }}>Chose β 选择 β</div>
-              <div style={{ fontSize: 10, color: C.DIM }}>{stats.beta}/{total} 人</div>
-            </Box>
+          {/* Role badge */}
+          <div style={{ display: "inline-block", background: nashRole === "P1" ? `${C.AMBER}15` : `${C.TEAL}15`, border: `2px solid ${nashRole === "P1" ? C.AMBER : C.TEAL}50`, borderRadius: 12, padding: "12px 28px", marginBottom: 20 }}>
+            <div style={{ fontSize: 11, color: C.DIM }}>你的角色 Your Role</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color: nashRole === "P1" ? C.AMBER : C.TEAL }}>
+              {nashRole === "P1" ? "Player 1 (行)" : "Player 2 (列)"}
+            </div>
+            <div style={{ fontSize: 12, color: C.TEXT2, marginTop: 4 }}>
+              策略: {myStrats.join(", ")}
+            </div>
           </div>
 
-          {/* Bar */}
-          <Box style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>策略分布 Distribution</div>
-            <div style={{ display: "flex", height: 28, borderRadius: 8, overflow: "hidden", background: `${C.DIM}20` }}>
-              <div style={{ width: `${aR}%`, background: `linear-gradient(90deg, #3A7BD5, ${C.ALPHA_C})`, transition: "width 0.6s ease", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "white" }}>
-                {aR > 12 ? `α ${aR}%` : ""}
-              </div>
-              <div style={{ width: `${bR}%`, background: `linear-gradient(90deg, #7B4FBF, ${C.BETA_C})`, transition: "width 0.6s ease", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "white" }}>
-                {bR > 12 ? `β ${bR}%` : ""}
-              </div>
+          {/* Matrix */}
+          <Box style={{ marginBottom: 16, textAlign: "left" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.TEAL, marginBottom: 8 }}>📋 收益矩阵 Payoff Matrix (P1, P2)</div>
+            <NashMatrix highlightRole={nashRole} />
+            <div style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>格式: P1收益, P2收益 · Format: P1 payoff, P2 payoff</div>
+          </Box>
+
+          {/* Rules */}
+          <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.TEAL}08`, border: `1px solid ${C.TEAL}20` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.TEAL, marginBottom: 6 }}>📖 规则 Rules</div>
+            <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.7 }}>
+              每一轮，你会和一个对面角色的同学随机匹配。你们同时选择策略，收益取决于双方的选择。目标：最大化你的收益！<br/>
+              <span style={{ color: C.DIM }}>Each round, you're randomly matched with someone playing the other role. Choose simultaneously; payoffs depend on both choices. Goal: maximize YOUR payoff!</span>
             </div>
           </Box>
 
-          {/* Polak comparison */}
-          <Box style={{ background: `${C.GOLD}08`, border: `1px solid ${C.GOLD}20`, marginBottom: 16 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>📖 对比 Polak (Yale 2007) Comparison</div>
-            <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
-              耶鲁课堂 Yale: ~85% chose α, ~15% chose β<br/>
-              普通人实验 General public: ~70% chose α, ~30% chose β<br/><br/>
-              <strong style={{ color: C.TEXT }}>你的课堂 Your class: {aR}% α, {bR}% β ({total} students)</strong><br/>
-              {total === 0 ? "还没有数据 No data yet — start the game!" :
-               aR > 75 ? "和耶鲁学生差不多！Similar to Yale — most chose the dominant strategy (under selfish preferences)" :
-               bR > 50 ? "你的学生更倾向合作 Your students prefer cooperation — interesting! Why?" :
-               "有趣的分布！Interesting — great for class discussion."}
+          {/* Player counts */}
+          <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+            <div style={{ flex: 1, background: C.SURFACE, borderRadius: 10, padding: 10, textAlign: "center", border: `1px solid ${C.AMBER}20` }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>P1 行玩家</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: C.AMBER }}>{nashPlayerCounts.p1}</div>
             </div>
+            <div style={{ flex: 1, background: C.SURFACE, borderRadius: 10, padding: 10, textAlign: "center", border: `1px solid ${C.TEAL}20` }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>P2 列玩家</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: C.TEAL }}>{nashPlayerCounts.p2}</div>
+            </div>
+          </div>
+
+          <div style={{ background: `${C.GOLD}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.GOLD}20` }}>
+            <div style={{ width: 40, height: 40, margin: "0 auto 8px", border: `3px solid ${C.DIM}30`, borderTopColor: C.TEAL, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 13, color: C.TEXT2 }}>等待老师开始第一轮...</div>
+            <div style={{ fontSize: 11, color: C.DIM }}>Waiting for teacher to start Round 1...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- NASH PLAY (render function) ----
+  function renderNashPlay() {
+    const myStrats = nashRole === "P1" ? NASH.P1_STRATS : NASH.P2_STRATS;
+    const stratColors = nashRole === "P1" ? [C.AMBER, "#C49030", C.RED] : [C.ALPHA_C, C.TEAL];
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #0F2420)` }}>
+        <div style={{ maxWidth: 400, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.TEAL, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {nashRound} · {nashRole === "P1" ? "Player 1 (行)" : "Player 2 (列)"}
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>选择你的策略</h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 16 }}>Make Your Choice</p>
+
+          {/* Compact matrix */}
+          <Box style={{ marginBottom: 20, padding: 12 }}>
+            <NashMatrix small />
           </Box>
 
-          {/* Recent results */}
-          {stats.results.length > 0 && (
-            <Box>
-              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>最近结果 Recent Results（含学号和验证码）</div>
-              {stats.results.slice(0, 20).map((r, i) => (
-                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: i < 19 ? `1px solid ${C.DIM}15` : "none", fontSize: 12 }}>
-                  <div style={{ flex: 1 }}>
-                    <span style={{ color: C.TEXT, fontWeight: 600 }}>{r.player}</span>
-                    {r.studentId && <span style={{ color: C.DIM, fontSize: 10, marginLeft: 6 }}>{r.studentId}</span>}
-                    {r.section && <span style={{ color: C.ALPHA_C, fontSize: 9, marginLeft: 4, background: `${C.ALPHA_C}15`, padding: "1px 5px", borderRadius: 3 }}>{r.section}</span>}
-                    {r.sessionCode && <span style={{ color: C.GOLD, fontSize: 9, marginLeft: 4, background: `${C.GOLD}15`, padding: "1px 5px", borderRadius: 3 }}>{r.sessionCode}</span>}
-                  </div>
-                  <span style={{ color: C.TEXT2, marginRight: 8 }}>
-                    <span style={{ color: r.choice === "α" ? C.ALPHA_C : C.BETA_C, fontWeight: 700 }}>{r.choice}</span>
+          {/* Strategy buttons */}
+          <div style={{ display: "flex", gap: 12, justifyContent: "center", marginBottom: 16 }}>
+            {myStrats.map((strat, i) => (
+              <button key={strat} className="btn-press" onClick={() => submitNashChoice(strat)}
+                style={{
+                  width: nashRole === "P1" ? 100 : 130, height: 120,
+                  fontSize: 36, fontWeight: 800,
+                  background: `linear-gradient(145deg, ${C.TEAL_DARK}, #0A1F1E)`,
+                  border: `2px solid ${NASH.STRAT_COLORS[strat]}60`,
+                  borderRadius: 18, color: NASH.STRAT_COLORS[strat],
+                  cursor: "pointer", display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center",
+                  boxShadow: `0 6px 20px ${NASH.STRAT_COLORS[strat]}20`,
+                }}>
+                {strat}
+                <div style={{ fontSize: 10, fontWeight: 400, marginTop: 4, opacity: 0.5, color: C.TEXT2 }}>
+                  {nashRole === "P1" ? ["Up", "Middle", "Down"][i] : ["Left", "Right"][i]}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          {/* History hint */}
+          {nashHistory.length > 0 && (
+            <div style={{ fontSize: 11, color: C.DIM }}>
+              上一轮: 你选 {nashHistory[nashHistory.length - 1].myChoice}, 对方选 {nashHistory[nashHistory.length - 1].oppChoice} → 你得 {nashHistory[nashHistory.length - 1].myPayoff}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ---- NASH WAIT (after submitting, before round ends) ----
+  function renderNashWait() {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #0F2420)` }}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ width: 50, height: 50, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.TEAL, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+          <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待本轮结束...</h2>
+          <p style={{ fontSize: 12, color: C.DIM }}>Round {nashRound} · Waiting for teacher to end round...</p>
+          <p style={{ fontSize: 14, color: C.TEXT2, marginTop: 12 }}>✓ 已提交 Submitted</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- NASH RESULT (after round ends) ----
+  function renderNashResult() {
+    const r = nashMyResult;
+    // Also show round stats
+    const rs = nashRoundStats;
+
+    return (
+      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #0F2420)`, overflowY: "auto" }}>
+        <div style={{ maxWidth: 420, margin: "0 auto", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.TEAL, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 8 }}>Round {nashRound} Results</div>
+
+          {r ? (
+            <>
+              {/* My match result */}
+              <div className="fade-up" style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>你的选择 You</div>
+                  <div style={{ fontSize: 32, fontWeight: 800, color: NASH.STRAT_COLORS[r.myChoice] || C.TEAL }}>{r.myChoice}</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: C.GREEN, marginTop: 2 }}>+{r.myPayoff}</div>
+                </Box>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>对方 {r.oppName}</div>
+                  <div style={{ fontSize: 32, fontWeight: 800, color: NASH.STRAT_COLORS[r.oppChoice] || C.TEXT }}>{r.oppChoice}</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: C.TEXT2, marginTop: 2 }}>+{r.oppPayoff}</div>
+                </Box>
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize: 13, color: C.DIM, marginBottom: 16 }}>未匹配到结果 No match result</div>
+          )}
+
+          {/* Round stats */}
+          {rs && (
+            <Box className="fade-up fade-up-1" style={{ marginBottom: 16, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.TEAL, marginBottom: 10 }}>📊 本轮全班分布 Class Distribution</div>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, color: C.AMBER, fontWeight: 600, marginBottom: 4 }}>P1 行玩家 ({rs.p1?.total || 0}人)</div>
+                <div style={{ display: "flex", height: 24, borderRadius: 6, overflow: "hidden", background: `${C.DIM}15` }}>
+                  {["U", "M", "D"].map(s => {
+                    const cnt = rs.p1?.[s] || 0;
+                    const pct = rs.p1?.total ? Math.round(cnt / rs.p1.total * 100) : 0;
+                    return pct > 0 ? (
+                      <div key={s} style={{ width: `${pct}%`, background: NASH.STRAT_COLORS[s], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#000", transition: "width 0.5s" }}>
+                        {pct > 12 ? `${s} ${pct}%` : s}
+                      </div>
+                    ) : null;
+                  })}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: 11, color: C.TEAL, fontWeight: 600, marginBottom: 4 }}>P2 列玩家 ({rs.p2?.total || 0}人)</div>
+                <div style={{ display: "flex", height: 24, borderRadius: 6, overflow: "hidden", background: `${C.DIM}15` }}>
+                  {["L", "R"].map(s => {
+                    const cnt = rs.p2?.[s] || 0;
+                    const pct = rs.p2?.total ? Math.round(cnt / rs.p2.total * 100) : 0;
+                    return pct > 0 ? (
+                      <div key={s} style={{ width: `${pct}%`, background: NASH.STRAT_COLORS[s], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#000", transition: "width 0.5s" }}>
+                        {pct > 15 ? `${s} ${pct}%` : s}
+                      </div>
+                    ) : null;
+                  })}
+                </div>
+              </div>
+            </Box>
+          )}
+
+          {/* History */}
+          {nashHistory.length > 0 && (
+            <Box className="fade-up fade-up-2" style={{ marginBottom: 16, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.DIM, marginBottom: 8 }}>📈 你的历史 Your History</div>
+              {nashHistory.map((h, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: i < nashHistory.length - 1 ? `1px solid ${C.DIM}15` : "none", fontSize: 12 }}>
+                  <span style={{ color: C.DIM }}>R{h.round}</span>
+                  <span style={{ color: C.TEXT2 }}>
+                    <span style={{ color: NASH.STRAT_COLORS[h.myChoice], fontWeight: 700 }}>{h.myChoice}</span>
                     {" vs "}
-                    <span style={{ color: r.oppChoice === "α" ? C.ALPHA_C : C.BETA_C, fontWeight: 700 }}>{r.oppChoice}</span>
+                    <span style={{ color: NASH.STRAT_COLORS[h.oppChoice], fontWeight: 700 }}>{h.oppChoice}</span>
                   </span>
-                  <span style={{ color: r.payoff >= 0 ? C.GREEN : C.RED, fontWeight: 700, minWidth: 28, textAlign: "right" }}>
-                    {r.payoff > 0 ? "+" : ""}{r.payoff}
-                  </span>
+                  <span style={{ color: C.GREEN, fontWeight: 700 }}>+{h.myPayoff}</span>
                 </div>
               ))}
             </Box>
           )}
 
-          {/* P-Beauty Contest Controls */}
-          <div style={{ background: `${C.PURPLE}08`, border: `1px solid ${C.PURPLE}25`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: C.PURPLE, marginBottom: 8 }}>🏆 选美博弈 P-Beauty Contest</div>
-            
-            <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
-              <div style={{ flex: 1, background: C.SURFACE, borderRadius: 8, padding: 10, textAlign: "center" }}>
-                <div style={{ fontSize: 10, color: C.DIM }}>已提交 Submissions</div>
-                <div style={{ fontSize: 28, fontWeight: 800, color: C.PURPLE }}>{beautySubCount}</div>
+          {/* Waiting for next round */}
+          <div style={{ background: `${C.TEAL}08`, borderRadius: 10, padding: 12, border: `1px solid ${C.TEAL}20` }}>
+            <div style={{ width: 30, height: 30, margin: "0 auto 8px", border: `2px solid ${C.DIM}30`, borderTopColor: C.TEAL, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 12, color: C.TEXT2 }}>等待老师开始下一轮... Waiting for next round...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ================================================================
+  // TEACHER PANEL
+  // ================================================================
+  if (screen === "teacher") {
+    const total = stats.alpha + stats.beta;
+    const aR = total > 0 ? Math.round(stats.alpha / total * 100) : 0;
+    const bR = total > 0 ? Math.round(stats.beta / total * 100) : 0;
+
+    const [teacherTab, setTeacherTab] = useState("grade");
+
+    return (
+      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #0F1A30)` }}>
+        <div style={{ maxWidth: 500, margin: "0 auto" }}>
+          <button className="btn-press" onClick={() => setScreen("home")} style={{ background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", marginBottom: 14 }}>← 返回</button>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 16 }}>🎓 教师面板 Teacher Panel</h2>
+
+          {/* Tab switcher */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
+            {[{ id: "grade", label: "📝 成绩", en: "Grade" }, { id: "beauty", label: "🏆 选美", en: "Beauty" }, { id: "nash", label: "⚖️ 纳什", en: "Nash" }].map(t => (
+              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); }}
+                style={{ flex: 1, padding: "10px 8px", fontSize: 13, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          {/* ---- GRADE TAB ---- */}
+          {teacherTab === "grade" && (
+            <div>
+              <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+                <Box style={{ flex: 1, textAlign: "center" }}><div style={{ fontSize: 32, fontWeight: 800, color: C.ALPHA_C }}>{aR}%</div><div style={{ fontSize: 12, color: C.TEXT2 }}>α ({stats.alpha})</div></Box>
+                <Box style={{ flex: 1, textAlign: "center" }}><div style={{ fontSize: 32, fontWeight: 800, color: C.BETA_C }}>{bR}%</div><div style={{ fontSize: 12, color: C.TEXT2 }}>β ({stats.beta})</div></Box>
+              </div>
+              <Box style={{ marginBottom: 16 }}>
+                <div style={{ display: "flex", height: 28, borderRadius: 8, overflow: "hidden", background: `${C.DIM}20` }}>
+                  <div style={{ width: `${aR}%`, background: `linear-gradient(90deg, #3A7BD5, ${C.ALPHA_C})`, transition: "width 0.6s", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "white" }}>{aR > 12 ? `α ${aR}%` : ""}</div>
+                  <div style={{ width: `${bR}%`, background: `linear-gradient(90deg, #7B4FBF, ${C.BETA_C})`, transition: "width 0.6s", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "white" }}>{bR > 12 ? `β ${bR}%` : ""}</div>
+                </div>
+              </Box>
+              <Box style={{ background: `${C.GOLD}08`, border: `1px solid ${C.GOLD}20`, marginBottom: 16 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>📖 对比 Polak (Yale 2007)</div>
+                <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+                  耶鲁: ~85% α, ~15% β<br/><strong style={{ color: C.TEXT }}>你的课堂: {aR}% α, {bR}% β ({total}人)</strong>
+                </div>
+              </Box>
+              {stats.results.length > 0 && (
+                <Box>
+                  <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>最近结果 Recent ({stats.results.length})</div>
+                  {stats.results.slice(0, 15).map((r, i) => (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: `1px solid ${C.DIM}10`, fontSize: 12 }}>
+                      <span style={{ color: C.TEXT }}>{r.player}</span>
+                      <span style={{ color: r.choice === "α" ? C.ALPHA_C : C.BETA_C, fontWeight: 700 }}>{r.choice}</span>
+                      <span style={{ color: r.payoff >= 0 ? C.GREEN : C.RED, fontWeight: 700 }}>{r.payoff > 0 ? "+" : ""}{r.payoff}</span>
+                    </div>
+                  ))}
+                </Box>
+              )}
+              <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                <button className="btn-press" onClick={loadStats} style={{ flex: 1, padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>🔄 刷新</button>
+                <button className="btn-press" onClick={async () => { const pw = prompt("Type 'reset':"); if (pw !== "reset") return; await db.ref(`games/${gameId}`).remove(); setStats({ alpha: 0, beta: 0, results: [] }); alert("✅ Reset!"); }}
+                  style={{ flex: 1, padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>🗑️ 清除</button>
               </div>
             </div>
+          )}
 
-            <div style={{ display: "flex", gap: 8 }}>
-              <button className="btn-press" onClick={revealBeautyResults}
-                style={{ flex: 1, padding: 12, fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 10, color: "white", cursor: "pointer", opacity: beautySubCount > 0 ? 1 : 0.4 }}
-                disabled={beautySubCount === 0}>
-                🎉 揭晓结果 Reveal Results
-              </button>
-              <button className="btn-press" onClick={resetBeautyContest}
-                style={{ padding: 12, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>
-                🗑️ 重置 Reset
+          {/* ---- BEAUTY TAB ---- */}
+          {teacherTab === "beauty" && (
+            <div>
+              <Box style={{ marginBottom: 16, textAlign: "center" }}>
+                <div style={{ fontSize: 10, color: C.DIM }}>已提交 Submissions</div>
+                <div style={{ fontSize: 36, fontWeight: 800, color: C.PURPLE }}>{beautySubCount}</div>
+              </Box>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn-press" onClick={revealBeautyResults}
+                  style={{ flex: 1, padding: 12, fontSize: 13, fontWeight: 700, background: `linear-gradient(135deg, #4A3070, #2D1B4E)`, border: "none", borderRadius: 10, color: "white", cursor: "pointer", opacity: beautySubCount > 0 ? 1 : 0.4 }} disabled={beautySubCount === 0}>
+                  🎉 揭晓结果
+                </button>
+                <button className="btn-press" onClick={resetBeautyContest}
+                  style={{ padding: 12, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>
+                  🗑️ 重置
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ---- NASH TAB ---- */}
+          {teacherTab === "nash" && (
+            <div>
+              {/* Status */}
+              <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>当前轮次 Round</div>
+                  <div style={{ fontSize: 32, fontWeight: 800, color: C.TEAL }}>{nashRound || "—"}</div>
+                </Box>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>阶段 Phase</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: nashPhase === "playing" ? C.GREEN : nashPhase === "results" ? C.GOLD : C.DIM, marginTop: 6 }}>
+                    {nashPhase === "playing" ? "进行中 Playing" : nashPhase === "results" ? "已结束 Results" : "等待中 Lobby"}
+                  </div>
+                </Box>
+              </div>
+
+              {/* Player & submission counts */}
+              <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+                <Box style={{ flex: 1, textAlign: "center", border: `1px solid ${C.AMBER}20` }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>P1 (行)</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: C.AMBER }}>{nashPlayerCounts.p1}</div>
+                  {nashPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>已交: {nashSubCounts.p1}</div>}
+                </Box>
+                <Box style={{ flex: 1, textAlign: "center", border: `1px solid ${C.TEAL}20` }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>P2 (列)</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: C.TEAL }}>{nashPlayerCounts.p2}</div>
+                  {nashPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>已交: {nashSubCounts.p2}</div>}
+                </Box>
+              </div>
+
+              {/* Control buttons */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+                {(nashPhase === "lobby" || nashPhase === "results") && (
+                  <button className="btn-press" onClick={() => nashStartRound((nashRound || 0) + 1)}
+                    style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, ${C.TEAL_DARK}, #0A1F1E)`, border: `1px solid ${C.TEAL}50`, borderRadius: 12, color: C.TEAL, cursor: "pointer" }}>
+                    ▶️ {nashRound ? `开始第 ${nashRound + 1} 轮` : "开始第 1 轮"}
+                  </button>
+                )}
+                {nashPhase === "playing" && (
+                  <button className="btn-press" onClick={nashEndRound}
+                    style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A0F, #1A1008)`, border: `1px solid ${C.AMBER}50`, borderRadius: 12, color: C.AMBER, cursor: "pointer" }}>
+                    ⏹️ 结束本轮 & 匹配
+                  </button>
+                )}
+                <button className="btn-press" onClick={nashResetGame}
+                  style={{ padding: 14, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                  🗑️
+                </button>
+              </div>
+
+              {/* Convergence chart */}
+              <Box style={{ marginBottom: 16, border: `1px solid ${C.TEAL}20` }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.TEAL, marginBottom: 10 }}>📈 收敛趋势 Convergence to NE (U, R)</div>
+                <ConvergenceChart allStats={nashAllStats} />
+                <div style={{ fontSize: 10, color: C.DIM, marginTop: 6, textAlign: "center" }}>
+                  NE预测: P1全选U, P2全选R → 两条线都趋向100%
+                </div>
+              </Box>
+
+              {/* Per-round stats table */}
+              {nashAllStats.length > 0 && (
+                <Box>
+                  <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>各轮数据 Round-by-round</div>
+                  <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.DIM }}>R</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.AMBER }}>U%</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.AMBER }}>M%</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.AMBER }}>D%</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.TEAL }}>L%</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.TEAL }}>R%</td>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {nashAllStats.map((s, i) => {
+                        const p1t = s.p1?.total || 1;
+                        const p2t = s.p2?.total || 1;
+                        return (
+                          <tr key={i} style={{ borderTop: `1px solid ${C.DIM}15` }}>
+                            <td style={{ padding: 4, color: C.TEXT }}>{s.round}</td>
+                            <td style={{ padding: 4, color: C.TEXT2 }}>{Math.round((s.p1?.U || 0) / p1t * 100)}</td>
+                            <td style={{ padding: 4, color: C.TEXT2 }}>{Math.round((s.p1?.M || 0) / p1t * 100)}</td>
+                            <td style={{ padding: 4, color: C.TEXT2 }}>{Math.round((s.p1?.D || 0) / p1t * 100)}</td>
+                            <td style={{ padding: 4, color: C.TEXT2 }}>{Math.round((s.p2?.L || 0) / p2t * 100)}</td>
+                            <td style={{ padding: 4, color: C.TEXT2 }}>{Math.round((s.p2?.R || 0) / p2t * 100)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </Box>
+              )}
+
+              <button className="btn-press" onClick={loadNashAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 12 }}>
+                🔄 刷新数据 Refresh
               </button>
             </div>
-          </div>
-
-          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-            <button className="btn-press" onClick={loadStats}
-              style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
-              🔄 刷新 Refresh
-            </button>
-            <button className="btn-press" onClick={async () => {
-              if (!firebaseReady) return;
-              const pw = prompt("确认清除所有数据？输入 reset 确认\nClear all data? Type 'reset' to confirm:");
-              if (pw !== "reset") return;
-              await db.ref(`games/${gameId}`).remove();
-              await db.ref("games/beauty_contest").remove();
-              setStats({ alpha: 0, beta: 0, results: [] });
-              alert("✅ 所有数据已清除（成绩博弈+选美博弈）\nAll data cleared (Grade Game + Beauty Contest)");
-            }}
-              style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 10, color: C.RED, cursor: "pointer" }}>
-              🗑️ 清除 Reset All
-            </button>
-          </div>
+          )}
         </div>
       </div>
     );
@@ -1179,18 +1480,14 @@ function App() {
         <button className="btn-press" onClick={() => setScreen("home")} style={{ background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer", marginBottom: 14 }}>← 返回</button>
         <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 16 }}>📊 历史记录 History</h2>
         {stats.results.length === 0 ? (
-          <p style={{ color: C.DIM, fontSize: 13 }}>还没有记录。去玩一局吧！No records yet — go play!</p>
+          <p style={{ color: C.DIM, fontSize: 13 }}>还没有记录。</p>
         ) : stats.results.map((r, i) => (
           <Box key={i} style={{ marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div>
               <div style={{ fontSize: 13, fontWeight: 600, color: C.TEXT }}>{r.player}</div>
-              <div style={{ fontSize: 10, color: C.DIM }}>
-                {r.choice} vs {r.opponent}({r.oppChoice})
-              </div>
+              <div style={{ fontSize: 10, color: C.DIM }}>{r.choice} vs {r.opponent}({r.oppChoice})</div>
             </div>
-            <div style={{ fontSize: 15, fontWeight: 700, color: r.payoff >= 0 ? C.GREEN : C.RED }}>
-              {r.payoff > 0 ? "+" : ""}{r.payoff}
-            </div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: r.payoff >= 0 ? C.GREEN : C.RED }}>{r.payoff > 0 ? "+" : ""}{r.payoff}</div>
           </Box>
         ))}
       </div>
