@@ -266,6 +266,20 @@ function App() {
   const [investResult, setInvestResult] = useState(null); // {total, invested, pct, threshold, success}
   const [investAllResults, setInvestAllResults] = useState([]); // [{round, threshold, total, invested, pct, success}]
 
+  // ---- Ultimatum Game state ----
+  const [ultRole, setUltRole] = useState(null); // "O" (Offerer) | "R" (Responder)
+  const [ultPhase, setUltPhase] = useState("lobby"); // "lobby" | "playing" | "results"
+  const [ultRound, setUltRound] = useState(0);
+  const [ultSubmitted, setUltSubmitted] = useState(false);
+  const [ultMyValue, setUltMyValue] = useState(null); // my offer or threshold
+  const [ultInputValue, setUltInputValue] = useState("");
+  const [ultMyResult, setUltMyResult] = useState(null);
+  const [ultHistory, setUltHistory] = useState([]);
+  const [ultSubCounts, setUltSubCounts] = useState({ o: 0, r: 0 });
+  const [ultPlayerCounts, setUltPlayerCounts] = useState({ o: 0, r: 0 });
+  const [ultRoundStats, setUltRoundStats] = useState(null); // {offers:[], thresholds:[], avgOffer, avgThreshold, acceptRate, matches:int}
+  const [ultAllStats, setUltAllStats] = useState([]);
+
   const game = GAMES[gameId];
   const myId = useRef(generateId());
   const nashId = useRef(() => {
@@ -277,6 +291,16 @@ function App() {
   });
   // Initialize nashId properly
   if (typeof nashId.current === "function") nashId.current = nashId.current();
+
+  const ultId = useRef(generateId());
+  // Initialize persistent ultimatum ID from localStorage
+  useEffect(() => {
+    try {
+      let id = localStorage.getItem("gt_ult_id");
+      if (!id) { id = generateId(); localStorage.setItem("gt_ult_id", id); }
+      ultId.current = id;
+    } catch {}
+  }, []);
 
   const listenersRef = useRef([]);
 
@@ -657,6 +681,243 @@ function App() {
   };
 
   // ================================================================
+  // ULTIMATUM GAME — Firebase listeners
+  // ================================================================
+  const ultListenersRef = useRef([]);
+
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const stateRef = db.ref("games/ultimatum/state");
+    const onState = stateRef.on("value", (snap) => {
+      const s = snap.val();
+      if (!s) { setUltPhase("lobby"); setUltRound(0); return; }
+      setUltPhase(s.phase || "lobby");
+      setUltRound(s.round || 0);
+    });
+    ultListenersRef.current.push(() => stateRef.off("value", onState));
+
+    const playersRef = db.ref("games/ultimatum/players");
+    const onPlayers = playersRef.on("value", (snap) => {
+      const p = snap.val() || {};
+      const vals = Object.values(p);
+      setUltPlayerCounts({
+        o: vals.filter(v => v.role === "O").length,
+        r: vals.filter(v => v.role === "R").length,
+      });
+    });
+    ultListenersRef.current.push(() => playersRef.off("value", onPlayers));
+
+    return () => ultListenersRef.current.forEach(off => off());
+  }, [firebaseReady]);
+
+  // Submission counts in current round
+  useEffect(() => {
+    if (!firebaseReady || !ultRound) return;
+    const subRef = db.ref(`games/ultimatum/rounds/${ultRound}/submissions`);
+    const onSub = subRef.on("value", (snap) => {
+      const s = snap.val() || {};
+      const vals = Object.values(s);
+      setUltSubCounts({
+        o: vals.filter(v => v.role === "O").length,
+        r: vals.filter(v => v.role === "R").length,
+      });
+    });
+    return () => subRef.off("value", onSub);
+  }, [firebaseReady, ultRound]);
+
+  // My match result when phase = results
+  useEffect(() => {
+    if (!firebaseReady || ultPhase !== "results" || !ultRound) return;
+    const resRef = db.ref(`games/ultimatum/rounds/${ultRound}/playerResults/${ultId.current}`);
+    resRef.once("value", (snap) => {
+      const r = snap.val();
+      if (r) {
+        setUltMyResult(r);
+        setUltHistory(prev => {
+          if (prev.find(h => h.round === ultRound)) return prev;
+          return [...prev, { round: ultRound, ...r }];
+        });
+      }
+    });
+    const statsRef = db.ref(`games/ultimatum/rounds/${ultRound}/stats`);
+    statsRef.once("value", (snap) => {
+      const s = snap.val();
+      if (s) {
+        setUltRoundStats(s);
+        setUltAllStats(prev => {
+          const filtered = prev.filter(x => x.round !== ultRound);
+          return [...filtered, { round: ultRound, ...s }].sort((a, b) => a.round - b.round);
+        });
+      }
+    });
+  }, [firebaseReady, ultPhase, ultRound]);
+
+  // Reset input when new round starts
+  useEffect(() => {
+    if (ultPhase === "playing") {
+      setUltSubmitted(false);
+      setUltMyValue(null);
+      setUltMyResult(null);
+      setUltRoundStats(null);
+      setUltInputValue("");
+    }
+  }, [ultPhase, ultRound]);
+
+  const loadUltAllStats = async () => {
+    if (!firebaseReady) return;
+    const snap = await db.ref("games/ultimatum/rounds").once("value");
+    const rounds = snap.val() || {};
+    const allStats = [];
+    for (const [rNum, rData] of Object.entries(rounds)) {
+      if (rData.stats) allStats.push({ round: parseInt(rNum), ...rData.stats });
+    }
+    setUltAllStats(allStats.sort((a, b) => a.round - b.round));
+  };
+
+  // ================================================================
+  // ULTIMATUM — Player functions
+  // ================================================================
+  const joinUltimatum = async () => {
+    if (!firebaseReady) return;
+    // Check if already joined
+    const existSnap = await db.ref(`games/ultimatum/players/${ultId.current}`).once("value");
+    if (existSnap.val()) {
+      setUltRole(existSnap.val().role);
+      setScreen("ult_intro");
+      return;
+    }
+    // Alternate role assignment (keep Offerer/Responder balanced)
+    const playersSnap = await db.ref("games/ultimatum/players").once("value");
+    const players = playersSnap.val() || {};
+    const vals = Object.values(players);
+    const oCount = vals.filter(v => v.role === "O").length;
+    const rCount = vals.filter(v => v.role === "R").length;
+    const role = oCount <= rCount ? "O" : "R";
+
+    await db.ref(`games/ultimatum/players/${ultId.current}`).set({
+      name: name || "匿名", studentId: studentId || "", role,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setUltRole(role);
+    setScreen("ult_intro");
+  };
+
+  const submitUltimatum = async (value) => {
+    if (!firebaseReady || !ultRound || ultSubmitted) return;
+    const v = parseInt(value);
+    if (isNaN(v) || v < 0 || v > 100) { alert("请输入0-100的整数 Enter integer 0-100"); return; }
+    await db.ref(`games/ultimatum/rounds/${ultRound}/submissions/${ultId.current}`).set({
+      role: ultRole, value: v, name: name || "匿名",
+      studentId: studentId || "",
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setUltMyValue(v);
+    setUltSubmitted(true);
+  };
+
+  // ================================================================
+  // ULTIMATUM — Teacher functions
+  // ================================================================
+  const ultStartRound = async (roundNum) => {
+    if (!firebaseReady) return;
+    await db.ref("games/ultimatum/state").set({ round: roundNum, phase: "playing" });
+  };
+
+  const ultEndRound = async () => {
+    if (!firebaseReady || !ultRound) return;
+    const snap = await db.ref(`games/ultimatum/rounds/${ultRound}/submissions`).once("value");
+    const subs = snap.val();
+    if (!subs) { alert("没有提交 No submissions!"); return; }
+
+    const entries = Object.entries(subs);
+    const oSubs = shuffle(entries.filter(([_, v]) => v.role === "O"));
+    const rSubs = shuffle(entries.filter(([_, v]) => v.role === "R"));
+
+    if (oSubs.length === 0 || rSubs.length === 0) {
+      alert("需要至少一个Offerer和一个Responder! Need at least one of each role!");
+      return;
+    }
+
+    // Match: pair each with a random opponent (cycle if unequal sizes)
+    const playerResults = {};
+    let accepted = 0, rejected = 0;
+    const matchLog = [];
+
+    // Match every Offerer with a random Responder
+    for (const [oId, oData] of oSubs) {
+      const randR = rSubs[Math.floor(Math.random() * rSubs.length)];
+      const [rId, rData] = randR;
+      const offer = oData.value;
+      const threshold = rData.value;
+      const isAccepted = offer >= threshold;
+      const oPay = isAccepted ? (100 - offer) : 0;
+      const rPay = isAccepted ? offer : 0;
+      if (isAccepted) accepted++; else rejected++;
+      matchLog.push({ offer, threshold, accepted: isAccepted });
+      playerResults[oId] = {
+        myRole: "O", myValue: offer, oppValue: threshold,
+        oppName: rData.name, accepted: isAccepted,
+        myPayoff: oPay, oppPayoff: rPay,
+      };
+    }
+    // Match every Responder with a random Offerer
+    for (const [rId, rData] of rSubs) {
+      const randO = oSubs[Math.floor(Math.random() * oSubs.length)];
+      const [oId, oData] = randO;
+      const offer = oData.value;
+      const threshold = rData.value;
+      const isAccepted = offer >= threshold;
+      const oPay = isAccepted ? (100 - offer) : 0;
+      const rPay = isAccepted ? offer : 0;
+      playerResults[rId] = {
+        myRole: "R", myValue: threshold, oppValue: offer,
+        oppName: oData.name, accepted: isAccepted,
+        myPayoff: rPay, oppPayoff: oPay,
+      };
+    }
+
+    // Stats
+    const offers = oSubs.map(([_, v]) => v.value);
+    const thresholds = rSubs.map(([_, v]) => v.value);
+    const avgOffer = offers.reduce((a, b) => a + b, 0) / offers.length;
+    const avgThreshold = thresholds.reduce((a, b) => a + b, 0) / thresholds.length;
+    const statsData = {
+      offers, thresholds,
+      avgOffer: Math.round(avgOffer * 10) / 10,
+      avgThreshold: Math.round(avgThreshold * 10) / 10,
+      medianOffer: [...offers].sort((a,b)=>a-b)[Math.floor(offers.length/2)],
+      medianThreshold: [...thresholds].sort((a,b)=>a-b)[Math.floor(thresholds.length/2)],
+      acceptRate: Math.round(accepted / (accepted + rejected) * 100),
+      oCount: oSubs.length, rCount: rSubs.length,
+      matches: accepted + rejected,
+    };
+
+    const updates = {};
+    updates[`games/ultimatum/rounds/${ultRound}/playerResults`] = playerResults;
+    updates[`games/ultimatum/rounds/${ultRound}/stats`] = statsData;
+    updates["games/ultimatum/state/phase"] = "results";
+    await db.ref().update(updates);
+
+    await loadUltAllStats();
+    alert(`✅ Round ${ultRound}: ${oSubs.length} offerers, ${rSubs.length} responders. Avg offer=${statsData.avgOffer}, Avg threshold=${statsData.avgThreshold}, Accept rate=${statsData.acceptRate}%`);
+  };
+
+  const ultResetGame = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("Type 'reset' to confirm (will clear all Ultimatum data):");
+    if (pw !== "reset") return;
+    await db.ref("games/ultimatum").remove();
+    setUltPhase("lobby"); setUltRound(0); setUltSubmitted(false);
+    setUltMyValue(null); setUltMyResult(null); setUltAllStats([]);
+    setUltHistory([]); setUltRole(null); setUltInputValue("");
+    // Issue a new ult ID so the student re-joins fresh
+    const newId = generateId();
+    ultId.current = newId;
+    try { localStorage.setItem("gt_ult_id", newId); } catch {}
+    alert("✅ 最后通牒博弈已重置 Ultimatum Game reset!");
+  };
+
+  // ================================================================
   // GRADE GAME — Human matching (unchanged)
   // ================================================================
   const submitHuman = async (myChoice) => {
@@ -949,10 +1210,22 @@ function App() {
           </button>
         </div>
 
+        {/* 5th game — Ultimatum (Week 7) spans full width */}
+        <button className="btn-press" onClick={() => {
+          if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
+          joinUltimatum();
+        }}
+          style={{ width: "100%", padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #3A1820, #1F0F18)", border: `1px solid ${C.RED}40`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.RED}25`, marginBottom: 12 }}
+          disabled={!firebaseReady}>
+          <span style={{ fontSize: 18, marginRight: 8 }}>🤝</span>
+          最后通牒博弈
+          <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Ultimatum Bargaining · Week 7</span>
+        </button>
+
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn-press" onClick={() => {
             const pw = prompt("请输入教师密码:");
-            if (pw === "econ2501") { loadStats(); loadNashAllStats(); loadInvestAllResults(); setScreen("teacher"); }
+            if (pw === "econ2501") { loadStats(); loadNashAllStats(); loadInvestAllResults(); loadUltAllStats(); setScreen("teacher"); }
             else if (pw !== null) alert("密码错误");
           }}
             style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}35`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
@@ -1623,6 +1896,315 @@ function App() {
   }
 
   // ================================================================
+  // ULTIMATUM GAME — Student screens
+  // ================================================================
+  if (screen === "ult_intro") {
+    const isPlaying = ultPhase === "playing" && ultRound > 0;
+    const isResults = ultPhase === "results" && ultRound > 0;
+
+    // Auto-navigate based on phase
+    if (isPlaying && !ultSubmitted) return renderUltPlay();
+    if (isPlaying && ultSubmitted) return renderUltWait();
+    if (isResults && ultMyResult) return renderUltResult();
+    if (isResults && !ultMyResult) return renderUltWait();
+
+    const isOfferer = ultRole === "O";
+    const roleColor = isOfferer ? C.GOLD : C.TEAL;
+    const roleBg = isOfferer ? "#2A2008" : C.TEAL_DARK;
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1F0F18)` }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>🤝</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>最后通牒博弈</h2>
+          <p style={{ fontSize: 13, color: C.RED, marginBottom: 20 }}>Ultimatum Bargaining · Week 7</p>
+
+          {/* Role badge */}
+          <div style={{ background: `linear-gradient(135deg, ${roleBg}, ${C.BG})`, border: `2px solid ${roleColor}60`, borderRadius: 14, padding: 16, marginBottom: 16 }}>
+            <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Your Role 你的角色</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color: roleColor, marginBottom: 4 }}>
+              {isOfferer ? "💰 Offerer 出价者" : "⚖️ Responder 回应者"}
+            </div>
+            <div style={{ fontSize: 11, color: C.TEXT2 }}>
+              {isOfferer
+                ? "You propose how to split 100 points"
+                : "You decide whether to accept offers"}
+            </div>
+          </div>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", border: `1px solid ${C.RED}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 10 }}>📋 规则 Rules</div>
+            <div style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.8 }}>
+              <p style={{ marginBottom: 6 }}>两名学生共同分配 <strong>100 点</strong>(1 课堂参与分)。</p>
+              <p style={{ marginBottom: 6 }}>• <strong style={{ color: C.GOLD }}>Offerer</strong> 提议给 Responder 的金额 <em>m</em> ∈ [0, 100]，自己留下 (100 − <em>m</em>)。</p>
+              <p style={{ marginBottom: 6 }}>• <strong style={{ color: C.TEAL }}>Responder</strong> 设定接受门槛 <em>t</em>：只要 <em>m ≥ t</em> 就接受。</p>
+              <p style={{ marginBottom: 6 }}>• 若 <strong style={{ color: C.GREEN }}>接受</strong> → Offerer 得 (100 − <em>m</em>), Responder 得 <em>m</em>。</p>
+              <p>• 若 <strong style={{ color: C.RED }}>拒绝</strong> → 双方都得 0。</p>
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.RED}08`, border: `1px solid ${C.RED}20` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 4 }}>💡 写下策略 Write Your Strategy</div>
+            <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.6 }}>
+              {isOfferer
+                ? "你提议给对方多少？给太多自己亏，给太少被拒双方都亏。"
+                : "你愿意接受的最低金额是多少？门槛太高可能全拒掉拿0，太低则被占便宜。"}
+            </div>
+          </Box>
+
+          <div style={{ background: `${C.RED}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.RED}20` }}>
+            <div style={{ width: 40, height: 40, margin: "0 auto 8px", border: `3px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 13, color: C.TEXT2 }}>等待老师开始... Waiting for teacher to start...</div>
+            <div style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>Offerers: {ultPlayerCounts.o} · Responders: {ultPlayerCounts.r}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- ULT PLAY ----
+  function renderUltPlay() {
+    const isOfferer = ultRole === "O";
+    const roleColor = isOfferer ? C.GOLD : C.TEAL;
+    const v = parseInt(ultInputValue);
+    const valid = !isNaN(v) && v >= 0 && v <= 100;
+    const previewYou = isOfferer ? (valid ? 100 - v : "—") : "—";
+    const previewThem = isOfferer ? (valid ? v : "—") : "—";
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1F0F18)` }}>
+        <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.RED, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {ultRound} · {isOfferer ? "💰 Offerer" : "⚖️ Responder"}
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>
+            {isOfferer ? "你提议给对方多少?" : "你愿意接受的最低金额?"}
+          </h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 20 }}>
+            {isOfferer ? "How much do you offer? (0–100)" : "What's your minimum acceptable offer? (0–100)"}
+          </p>
+
+          <Box style={{ marginBottom: 16, padding: 16 }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>
+              {isOfferer ? "你的提议 Your offer m" : "你的门槛 Your threshold t"}
+            </div>
+            <input type="number" min="0" max="100" value={ultInputValue}
+              onChange={e => setUltInputValue(e.target.value.replace(/[^0-9]/g, "").slice(0, 3))}
+              placeholder="0 – 100"
+              style={{ width: "100%", padding: "14px 16px", fontSize: 28, fontWeight: 800, textAlign: "center", background: C.BG, border: `2px solid ${roleColor}40`, borderRadius: 12, color: roleColor, outline: "none" }}
+              onFocus={e => e.target.style.borderColor = roleColor}
+              onBlur={e => e.target.style.borderColor = `${roleColor}40`} />
+
+            {/* Slider for faster input */}
+            <input type="range" min="0" max="100" value={valid ? v : 50}
+              onChange={e => setUltInputValue(e.target.value)}
+              style={{ width: "100%", marginTop: 12, accentColor: roleColor }} />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.DIM, marginTop: -4 }}>
+              <span>0</span><span>25</span><span>50</span><span>75</span><span>100</span>
+            </div>
+          </Box>
+
+          {/* Preview */}
+          {isOfferer && valid && (
+            <Box style={{ marginBottom: 16, padding: 12, background: `${C.GOLD}08`, border: `1px solid ${C.GOLD}20` }}>
+              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>如果被接受 If accepted:</div>
+              <div style={{ display: "flex", justifyContent: "space-around", alignItems: "center" }}>
+                <div><div style={{ fontSize: 10, color: C.DIM }}>你 You</div><div style={{ fontSize: 22, fontWeight: 800, color: C.GOLD }}>{previewYou}</div></div>
+                <div style={{ fontSize: 20, color: C.DIM }}>|</div>
+                <div><div style={{ fontSize: 10, color: C.DIM }}>对方 Them</div><div style={{ fontSize: 22, fontWeight: 800, color: C.TEXT2 }}>{previewThem}</div></div>
+              </div>
+            </Box>
+          )}
+          {!isOfferer && valid && (
+            <Box style={{ marginBottom: 16, padding: 12, background: `${C.TEAL}08`, border: `1px solid ${C.TEAL}20`, textAlign: "left" }}>
+              <div style={{ fontSize: 11, color: C.DIM, marginBottom: 4 }}>你的策略 Your strategy:</div>
+              <div style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.6 }}>
+                接受任何 <strong style={{ color: C.GREEN }}>m ≥ {v}</strong> 的提议；<br/>
+                拒绝任何 <strong style={{ color: C.RED }}>m &lt; {v}</strong> 的提议。
+              </div>
+            </Box>
+          )}
+
+          <button className="btn-press" onClick={() => submitUltimatum(ultInputValue)} disabled={!valid}
+            style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 800, background: valid ? `linear-gradient(135deg, ${roleColor}, ${isOfferer ? "#8A6A2A" : "#2A6A66"})` : C.SURFACE, border: "none", borderRadius: 12, color: valid ? "#0F0F0F" : C.DIM, cursor: valid ? "pointer" : "not-allowed", boxShadow: valid ? `0 6px 24px ${roleColor}30` : "none" }}>
+            ✓ 提交策略 Submit
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- ULT WAIT ----
+  function renderUltWait() {
+    const isOfferer = ultRole === "O";
+    const roleColor = isOfferer ? C.GOLD : C.TEAL;
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1F0F18)` }}>
+        <div style={{ textAlign: "center", maxWidth: 360 }}>
+          <div style={{ width: 50, height: 50, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+          <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待匹配...</h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 14 }}>Round {ultRound} · Waiting for matching</p>
+          <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${roleColor}30`, marginBottom: 12 }}>
+            <div style={{ fontSize: 10, color: C.DIM }}>Your {isOfferer ? "offer" : "threshold"}</div>
+            <div style={{ fontSize: 36, fontWeight: 800, color: roleColor }}>{ultMyValue}</div>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Box style={{ flex: 1, textAlign: "center", padding: 10 }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>Offerers 提交</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: C.GOLD }}>{ultSubCounts.o}</div>
+            </Box>
+            <Box style={{ flex: 1, textAlign: "center", padding: 10 }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>Responders 提交</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: C.TEAL }}>{ultSubCounts.r}</div>
+            </Box>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- ULT RESULT ----
+  function renderUltResult() {
+    const r = ultMyResult;
+    if (!r) return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: `linear-gradient(165deg, ${C.BG}, #1F0F18)` }}>
+        <div style={{ width: 40, height: 40, border: `3px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      </div>
+    );
+
+    const isOfferer = r.myRole === "O";
+    const roleColor = isOfferer ? C.GOLD : C.TEAL;
+    const bgTint = r.accepted ? "#0B200F" : "#200B0B";
+
+    // Build histograms from latest round stats
+    const stats = ultRoundStats;
+    const makeHist = (values, bins = 11) => {
+      const counts = Array(bins).fill(0);
+      values.forEach(v => {
+        const idx = Math.min(Math.floor(v / (100 / (bins - 1))), bins - 1);
+        counts[idx]++;
+      });
+      return counts;
+    };
+    const offerHist = stats?.offers ? makeHist(stats.offers) : null;
+    const threshHist = stats?.thresholds ? makeHist(stats.thresholds) : null;
+    const maxBin = (offerHist && threshHist)
+      ? Math.max(...offerHist, ...threshHist, 1)
+      : 1;
+
+    return (
+      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, ${bgTint})`, overflowY: "auto" }}>
+        <div style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
+          <div className="fade-up" style={{ fontSize: 48, marginBottom: 8 }}>{r.accepted ? "🤝" : "💢"}</div>
+          <h2 className="fade-up fade-up-1" style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>
+            {r.accepted ? "成交！Deal!" : "拒绝! Rejected!"}
+          </h2>
+          <p className="fade-up fade-up-1" style={{ fontSize: 13, color: r.accepted ? C.GREEN : C.RED, marginBottom: 20 }}>
+            Round {ultRound} · {isOfferer ? "你是 Offerer" : "你是 Responder"}
+          </p>
+
+          {/* Match breakdown */}
+          <Box className="fade-up fade-up-2" style={{ marginBottom: 16, padding: 14, textAlign: "left", border: `1px solid ${roleColor}30` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: roleColor, marginBottom: 10 }}>🎯 你的匹配 Your Match</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 13 }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM }}>{isOfferer ? "你的提议 m" : "你的门槛 t"}</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: roleColor }}>{r.myValue}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM }}>{isOfferer ? "对方门槛 t" : "对方提议 m"}</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: C.TEXT2 }}>{r.oppValue}</div>
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: C.DIM, marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.DIM}20` }}>
+              对手 Partner: <span style={{ color: C.TEXT }}>{r.oppName}</span>
+            </div>
+            <div style={{ fontSize: 11, color: C.TEXT2, marginTop: 6, fontFamily: "monospace" }}>
+              {isOfferer
+                ? `m=${r.myValue} ${r.accepted ? "≥" : "<"} t=${r.oppValue} → ${r.accepted ? "ACCEPTED ✓" : "REJECTED ✗"}`
+                : `m=${r.oppValue} ${r.accepted ? "≥" : "<"} t=${r.myValue} → ${r.accepted ? "ACCEPTED ✓" : "REJECTED ✗"}`}
+            </div>
+          </Box>
+
+          {/* Payoffs */}
+          <div className="fade-up fade-up-2" style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+            <Box style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>你的收益 Your payoff</div>
+              <div style={{ fontSize: 32, fontWeight: 800, color: r.myPayoff > 0 ? C.GREEN : C.DIM }}>{r.myPayoff}</div>
+            </Box>
+            <Box style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>对方收益 Their payoff</div>
+              <div style={{ fontSize: 32, fontWeight: 800, color: r.oppPayoff > 0 ? C.GREEN : C.DIM }}>{r.oppPayoff}</div>
+            </Box>
+          </div>
+
+          {/* Class-wide distributions */}
+          {stats && offerHist && threshHist && (
+            <Box className="fade-up fade-up-3" style={{ marginBottom: 16, padding: 14, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 10 }}>📊 班级分布 Class Distribution</div>
+              <div style={{ display: "flex", gap: 20, fontSize: 11, marginBottom: 10 }}>
+                <span style={{ color: C.GOLD }}>● Offers (n={stats.oCount}), 均值={stats.avgOffer}</span>
+                <span style={{ color: C.TEAL }}>● Thresholds (n={stats.rCount}), 均值={stats.avgThreshold}</span>
+              </div>
+
+              {/* Overlaid histogram */}
+              <svg viewBox="0 0 340 140" style={{ width: "100%", maxWidth: 380 }}>
+                {[0, 25, 50, 75, 100].map(tick => (
+                  <g key={tick}>
+                    <line x1={20 + tick * 3} y1={10} x2={20 + tick * 3} y2={110} stroke={`${C.DIM}15`} strokeWidth="0.5" />
+                    <text x={20 + tick * 3} y={125} textAnchor="middle" fontSize="9" fill={C.DIM}>{tick}</text>
+                  </g>
+                ))}
+                {offerHist.map((c, i) => {
+                  const x = 20 + i * 30;
+                  const h = (c / maxBin) * 90;
+                  return <rect key={`o${i}`} x={x - 8} y={110 - h} width="7" height={h} fill={C.GOLD} opacity="0.75" />;
+                })}
+                {threshHist.map((c, i) => {
+                  const x = 20 + i * 30;
+                  const h = (c / maxBin) * 90;
+                  return <rect key={`t${i}`} x={x + 1} y={110 - h} width="7" height={h} fill={C.TEAL} opacity="0.75" />;
+                })}
+                {/* Mean markers */}
+                <line x1={20 + stats.avgOffer * 3} y1={8} x2={20 + stats.avgOffer * 3} y2={112} stroke={C.GOLD} strokeWidth="1.5" strokeDasharray="3,2" />
+                <line x1={20 + stats.avgThreshold * 3} y1={8} x2={20 + stats.avgThreshold * 3} y2={112} stroke={C.TEAL} strokeWidth="1.5" strokeDasharray="3,2" />
+                <text x={20} y={9} fontSize="8" fill={C.DIM}>bin=10</text>
+              </svg>
+
+              <div style={{ display: "flex", justifyContent: "space-around", fontSize: 11, marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.DIM}20` }}>
+                <span style={{ color: C.TEXT2 }}>接受率 Accept: <strong style={{ color: C.GREEN }}>{stats.acceptRate}%</strong></span>
+                <span style={{ color: C.TEXT2 }}>中位 Offer: <strong style={{ color: C.GOLD }}>{stats.medianOffer}</strong></span>
+                <span style={{ color: C.TEXT2 }}>中位 Thresh: <strong style={{ color: C.TEAL }}>{stats.medianThreshold}</strong></span>
+              </div>
+            </Box>
+          )}
+
+          {/* SPNE contrast — the pedagogical punchline */}
+          <Box className="fade-up fade-up-3" style={{ marginBottom: 16, padding: 14, background: `${C.RED}08`, border: `1px solid ${C.RED}25`, textAlign: "left" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 6 }}>🎓 SPNE 预测 vs 实际</div>
+            <div style={{ fontSize: 12, color: C.TEXT2, lineHeight: 1.7 }}>
+              标准分析: Offerer 应提议 <strong style={{ color: C.GOLD }}>m* = 0</strong>, Responder 接受所有 <strong style={{ color: C.TEAL }}>t* = 0</strong>.<br/>
+              {stats && (
+                <span>
+                  本轮均值: m̄ = <strong style={{ color: C.GOLD }}>{stats.avgOffer}</strong>, t̄ = <strong style={{ color: C.TEAL }}>{stats.avgThreshold}</strong>.
+                  {" "}偏离 SPNE 很远 — 为什么? 公平偏好、spite、情感. (Watson 19.8)
+                </span>
+              )}
+            </div>
+          </Box>
+
+          {/* Waiting for next round */}
+          <div style={{ background: `${C.RED}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.RED}20` }}>
+            <div style={{ width: 30, height: 30, margin: "0 auto 8px", border: `2px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 12, color: C.TEXT2 }}>等待下一轮... Waiting for next round...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ================================================================
   // TEACHER PANEL
   // ================================================================
   if (screen === "teacher") {
@@ -1637,10 +2219,10 @@ function App() {
           <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 16 }}>🎓 教师面板 Teacher Panel</h2>
 
           {/* Tab switcher */}
-          <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
-            {[{ id: "grade", label: "📝 成绩", en: "Grade" }, { id: "beauty", label: "🏆 选美", en: "Beauty" }, { id: "nash", label: "⚖️ 纳什", en: "Nash" }, { id: "invest", label: "💰 投资", en: "Invest" }].map(t => (
-              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); }}
-                style={{ flex: 1, padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
+          <div style={{ display: "flex", gap: 4, marginBottom: 20, flexWrap: "wrap" }}>
+            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }].map(t => (
+              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); }}
+                style={{ flex: "1 1 80px", padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
                 {t.label}
               </button>
             ))}
@@ -1888,6 +2470,156 @@ function App() {
               </div>
             </div>
           )}
+
+          {/* ---- ULTIMATUM TAB ---- */}
+          {teacherTab === "ultimatum" && (() => {
+            const latest = ultAllStats.length > 0 ? ultAllStats[ultAllStats.length - 1] : null;
+            const makeHist = (values, bins = 11) => {
+              const counts = Array(bins).fill(0);
+              values.forEach(v => {
+                const idx = Math.min(Math.floor(v / (100 / (bins - 1))), bins - 1);
+                counts[idx]++;
+              });
+              return counts;
+            };
+            const oHist = latest?.offers ? makeHist(latest.offers) : null;
+            const tHist = latest?.thresholds ? makeHist(latest.thresholds) : null;
+            const maxBin = (oHist && tHist) ? Math.max(...oHist, ...tHist, 1) : 1;
+            return (
+            <div>
+              {/* Status */}
+              <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>轮次 Round</div>
+                  <div style={{ fontSize: 32, fontWeight: 800, color: C.RED }}>{ultRound || "—"}</div>
+                </Box>
+                <Box style={{ flex: 1, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>阶段 Phase</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: ultPhase === "playing" ? C.GREEN : ultPhase === "results" ? C.GOLD : C.DIM, marginTop: 6 }}>
+                    {ultPhase === "playing" ? "进行中" : ultPhase === "results" ? "已揭晓" : "等待中"}
+                  </div>
+                </Box>
+              </div>
+
+              {/* Role counts */}
+              <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+                <Box style={{ flex: 1, textAlign: "center", border: `1px solid ${C.GOLD}20` }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>💰 Offerers</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: C.GOLD }}>{ultPlayerCounts.o}</div>
+                  {ultPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>已交: {ultSubCounts.o}</div>}
+                </Box>
+                <Box style={{ flex: 1, textAlign: "center", border: `1px solid ${C.TEAL}20` }}>
+                  <div style={{ fontSize: 10, color: C.DIM }}>⚖️ Responders</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: C.TEAL }}>{ultPlayerCounts.r}</div>
+                  {ultPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>已交: {ultSubCounts.r}</div>}
+                </Box>
+              </div>
+
+              {/* Controls */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+                {(ultPhase === "lobby" || ultPhase === "results") && (
+                  <button className="btn-press" onClick={() => ultStartRound((ultRound || 0) + 1)}
+                    style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #3A1820, #1F0F18)`, border: `1px solid ${C.RED}50`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                    ▶️ {ultRound ? `开始第 ${ultRound + 1} 轮` : "开始第 1 轮"}
+                  </button>
+                )}
+                {ultPhase === "playing" && (
+                  <button className="btn-press" onClick={ultEndRound}
+                    style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A0F, #1A1008)`, border: `1px solid ${C.AMBER}50`, borderRadius: 12, color: C.AMBER, cursor: "pointer" }}>
+                    ⏹️ 结束 & 匹配
+                  </button>
+                )}
+                <button className="btn-press" onClick={ultResetGame}
+                  style={{ padding: 14, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                  🗑️
+                </button>
+              </div>
+
+              {/* Latest round histogram */}
+              {latest && oHist && tHist && (
+                <Box style={{ marginBottom: 16, border: `1px solid ${C.RED}20` }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 8 }}>
+                    📊 第 {latest.round} 轮分布 Round {latest.round} Distribution
+                  </div>
+                  <div style={{ display: "flex", gap: 14, fontSize: 10, marginBottom: 6 }}>
+                    <span style={{ color: C.GOLD }}>■ Offers (μ={latest.avgOffer}, median={latest.medianOffer})</span>
+                    <span style={{ color: C.TEAL }}>■ Thresholds (μ={latest.avgThreshold}, median={latest.medianThreshold})</span>
+                  </div>
+                  <svg viewBox="0 0 340 160" style={{ width: "100%" }}>
+                    {[0, 25, 50, 75, 100].map(tick => (
+                      <g key={tick}>
+                        <line x1={20 + tick * 3} y1={10} x2={20 + tick * 3} y2={130} stroke={`${C.DIM}15`} strokeWidth="0.5" />
+                        <text x={20 + tick * 3} y={145} textAnchor="middle" fontSize="9" fill={C.DIM}>{tick}</text>
+                      </g>
+                    ))}
+                    {oHist.map((c, i) => {
+                      const x = 20 + i * 30;
+                      const h = (c / maxBin) * 110;
+                      return <g key={`o${i}`}>
+                        <rect x={x - 8} y={130 - h} width="7" height={h} fill={C.GOLD} opacity="0.75" />
+                        {c > 0 && <text x={x - 4.5} y={128 - h} textAnchor="middle" fontSize="7" fill={C.GOLD}>{c}</text>}
+                      </g>;
+                    })}
+                    {tHist.map((c, i) => {
+                      const x = 20 + i * 30;
+                      const h = (c / maxBin) * 110;
+                      return <g key={`t${i}`}>
+                        <rect x={x + 1} y={130 - h} width="7" height={h} fill={C.TEAL} opacity="0.75" />
+                        {c > 0 && <text x={x + 4.5} y={128 - h} textAnchor="middle" fontSize="7" fill={C.TEAL}>{c}</text>}
+                      </g>;
+                    })}
+                    {/* Mean lines */}
+                    <line x1={20 + latest.avgOffer * 3} y1={8} x2={20 + latest.avgOffer * 3} y2={132} stroke={C.GOLD} strokeWidth="1.5" strokeDasharray="3,2" />
+                    <line x1={20 + latest.avgThreshold * 3} y1={8} x2={20 + latest.avgThreshold * 3} y2={132} stroke={C.TEAL} strokeWidth="1.5" strokeDasharray="3,2" />
+                    {/* SPNE marker at 0 */}
+                    <line x1={20} y1={8} x2={20} y2={132} stroke={C.RED} strokeWidth="1.2" strokeDasharray="2,2" />
+                    <text x={24} y={14} fontSize="8" fill={C.RED}>SPNE = 0</text>
+                  </svg>
+                  <div style={{ fontSize: 11, color: C.TEXT2, textAlign: "center", marginTop: 4, paddingTop: 6, borderTop: `1px solid ${C.DIM}20` }}>
+                    接受率 Accept rate: <strong style={{ color: latest.acceptRate >= 50 ? C.GREEN : C.RED }}>{latest.acceptRate}%</strong>
+                    {" · "}
+                    匹配数 Matches: <strong style={{ color: C.TEXT }}>{latest.matches}</strong>
+                  </div>
+                </Box>
+              )}
+
+              {/* Multi-round summary */}
+              {ultAllStats.length > 0 && (
+                <Box>
+                  <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>各轮对比 Round-by-round</div>
+                  <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.DIM }}>R</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.GOLD }}>μ Offer</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.GOLD }}>Med</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.TEAL }}>μ Thresh</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.TEAL }}>Med</td>
+                        <td style={{ padding: 4, fontWeight: 700, color: C.GREEN }}>Accept%</td>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ultAllStats.map((s, i) => (
+                        <tr key={i} style={{ borderTop: `1px solid ${C.DIM}15` }}>
+                          <td style={{ padding: 4, color: C.TEXT }}>{s.round}</td>
+                          <td style={{ padding: 4, color: C.TEXT2 }}>{s.avgOffer}</td>
+                          <td style={{ padding: 4, color: C.DIM }}>{s.medianOffer}</td>
+                          <td style={{ padding: 4, color: C.TEXT2 }}>{s.avgThreshold}</td>
+                          <td style={{ padding: 4, color: C.DIM }}>{s.medianThreshold}</td>
+                          <td style={{ padding: 4, color: s.acceptRate >= 50 ? C.GREEN : C.RED, fontWeight: 700 }}>{s.acceptRate}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </Box>
+              )}
+
+              <button className="btn-press" onClick={loadUltAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 12 }}>
+                🔄 刷新数据 Refresh
+              </button>
+            </div>
+            );
+          })()}
         </div>
       </div>
     );
