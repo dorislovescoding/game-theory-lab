@@ -280,6 +280,25 @@ function App() {
   const [ultRoundStats, setUltRoundStats] = useState(null); // {offers:[], thresholds:[], avgOffer, avgThreshold, acceptRate, matches:int}
   const [ultAllStats, setUltAllStats] = useState([]);
 
+  // ---- LEMONS MARKET (Asymmetric Information) ----
+  const [lemRole, setLemRole] = useState(null); // "S" (Seller) | "B" (Buyer)
+  const [lemPhase, setLemPhase] = useState("lobby"); // "lobby" | "playing" | "results"
+  const [lemRound, setLemRound] = useState(0);
+  const [lemRoundConfig, setLemRoundConfig] = useState(null); // {info:"full"|"asym", peachProb:0.5}
+  const [lemMyCarType, setLemMyCarType] = useState(null); // for sellers: "peach" | "lemon"; for buyers in full info: matched type
+  const [lemSubmitted, setLemSubmitted] = useState(false);
+  const [lemMyValue, setLemMyValue] = useState(null); // ask or bid
+  const [lemInputValue, setLemInputValue] = useState("");
+  const [lemMyResult, setLemMyResult] = useState(null);
+  const [lemHistory, setLemHistory] = useState([]);
+  const [lemSubCounts, setLemSubCounts] = useState({ s: 0, b: 0 });
+  const [lemPlayerCounts, setLemPlayerCounts] = useState({ s: 0, b: 0 });
+  const [lemRoundStats, setLemRoundStats] = useState(null);
+  const [lemAllStats, setLemAllStats] = useState([]);
+  // Teacher-side controls for next round
+  const [lemNextInfo, setLemNextInfo] = useState("asym"); // "full" | "asym"
+  const [lemNextPeachProb, setLemNextPeachProb] = useState(50); // percent
+
   const game = GAMES[gameId];
   const myId = useRef(generateId());
   const nashId = useRef(() => {
@@ -299,6 +318,16 @@ function App() {
       let id = localStorage.getItem("gt_ult_id");
       if (!id) { id = generateId(); localStorage.setItem("gt_ult_id", id); }
       ultId.current = id;
+    } catch {}
+  }, []);
+
+  const lemId = useRef(generateId());
+  // Initialize persistent lemons ID from localStorage
+  useEffect(() => {
+    try {
+      let id = localStorage.getItem("gt_lem_id");
+      if (!id) { id = generateId(); localStorage.setItem("gt_lem_id", id); }
+      lemId.current = id;
     } catch {}
   }, []);
 
@@ -918,6 +947,420 @@ function App() {
   };
 
   // ================================================================
+  // LEMONS MARKET — Firebase listeners
+  // Values: peach seller=2000 buyer=2400; lemon seller=1000 buyer=1200
+  // ================================================================
+  const LEM_VALS = {
+    peach: { seller: 2000, buyer: 2400 },
+    lemon: { seller: 1000, buyer: 1200 },
+  };
+  const lemListenersRef = useRef([]);
+
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const stateRef = db.ref("games/lemons/state");
+    const onState = stateRef.on("value", (snap) => {
+      const s = snap.val();
+      if (!s) { setLemPhase("lobby"); setLemRound(0); setLemRoundConfig(null); return; }
+      setLemPhase(s.phase || "lobby");
+      setLemRound(s.round || 0);
+      setLemRoundConfig(s.config || null);
+    });
+    lemListenersRef.current.push(() => stateRef.off("value", onState));
+
+    const playersRef = db.ref("games/lemons/players");
+    const onPlayers = playersRef.on("value", (snap) => {
+      const p = snap.val() || {};
+      const vals = Object.values(p);
+      setLemPlayerCounts({
+        s: vals.filter(v => v.role === "S").length,
+        b: vals.filter(v => v.role === "B").length,
+      });
+    });
+    lemListenersRef.current.push(() => playersRef.off("value", onPlayers));
+
+    return () => lemListenersRef.current.forEach(off => off());
+  }, [firebaseReady]);
+
+  // Submission counts in current round
+  useEffect(() => {
+    if (!firebaseReady || !lemRound) return;
+    const subRef = db.ref(`games/lemons/rounds/${lemRound}/submissions`);
+    const onSub = subRef.on("value", (snap) => {
+      const s = snap.val() || {};
+      const vals = Object.values(s);
+      setLemSubCounts({
+        s: vals.filter(v => v.role === "S").length,
+        b: vals.filter(v => v.role === "B").length,
+      });
+    });
+    return () => subRef.off("value", onSub);
+  }, [firebaseReady, lemRound]);
+
+  // My private car-type assignment (sellers only) when round starts
+  useEffect(() => {
+    if (!firebaseReady || lemPhase !== "playing" || !lemRound || lemRole !== "S") return;
+    const assignRef = db.ref(`games/lemons/rounds/${lemRound}/assignments/${lemId.current}`);
+    assignRef.once("value", (snap) => {
+      const a = snap.val();
+      if (a) setLemMyCarType(a.carType);
+    });
+  }, [firebaseReady, lemPhase, lemRound, lemRole]);
+
+  // Buyer pre-match in full-info rounds: fetch matched seller's car type
+  useEffect(() => {
+    if (!firebaseReady || lemPhase !== "playing" || !lemRound || lemRole !== "B") return;
+    if (!lemRoundConfig || lemRoundConfig.info !== "full") {
+      setLemMyCarType(null);
+      return;
+    }
+    const matchRef = db.ref(`games/lemons/rounds/${lemRound}/buyerMatches/${lemId.current}`);
+    matchRef.once("value", (snap) => {
+      const m = snap.val();
+      if (m) setLemMyCarType(m.carType);
+    });
+  }, [firebaseReady, lemPhase, lemRound, lemRole, lemRoundConfig]);
+
+  // My match result when phase = results
+  useEffect(() => {
+    if (!firebaseReady || lemPhase !== "results" || !lemRound) return;
+    const resRef = db.ref(`games/lemons/rounds/${lemRound}/playerResults/${lemId.current}`);
+    resRef.once("value", (snap) => {
+      const r = snap.val();
+      if (r) {
+        setLemMyResult(r);
+        setLemHistory(prev => {
+          if (prev.find(h => h.round === lemRound)) return prev;
+          return [...prev, { round: lemRound, ...r }];
+        });
+      }
+    });
+    const statsRef = db.ref(`games/lemons/rounds/${lemRound}/stats`);
+    statsRef.once("value", (snap) => {
+      const s = snap.val();
+      if (s) {
+        setLemRoundStats(s);
+        setLemAllStats(prev => {
+          const filtered = prev.filter(x => x.round !== lemRound);
+          return [...filtered, { round: lemRound, ...s }].sort((a, b) => a.round - b.round);
+        });
+      }
+    });
+  }, [firebaseReady, lemPhase, lemRound]);
+
+  // Reset input when new round starts
+  useEffect(() => {
+    if (lemPhase === "playing") {
+      setLemSubmitted(false);
+      setLemMyValue(null);
+      setLemMyResult(null);
+      setLemRoundStats(null);
+      setLemInputValue("");
+      // Don't reset lemMyCarType here — the assignment effect will overwrite
+    }
+  }, [lemPhase, lemRound]);
+
+  const loadLemAllStats = async () => {
+    if (!firebaseReady) return;
+    const snap = await db.ref("games/lemons/rounds").once("value");
+    const rounds = snap.val() || {};
+    const allStats = [];
+    for (const [rNum, rData] of Object.entries(rounds)) {
+      if (rData.stats) allStats.push({ round: parseInt(rNum), ...rData.stats });
+    }
+    setLemAllStats(allStats.sort((a, b) => a.round - b.round));
+  };
+
+  // ================================================================
+  // LEMONS — Player functions
+  // ================================================================
+  const joinLemons = async () => {
+    if (!firebaseReady) return;
+    const existSnap = await db.ref(`games/lemons/players/${lemId.current}`).once("value");
+    if (existSnap.val()) {
+      setLemRole(existSnap.val().role);
+      setScreen("lem_intro");
+      return;
+    }
+    const playersSnap = await db.ref("games/lemons/players").once("value");
+    const players = playersSnap.val() || {};
+    const vals = Object.values(players);
+    const sCount = vals.filter(v => v.role === "S").length;
+    const bCount = vals.filter(v => v.role === "B").length;
+    const role = sCount <= bCount ? "S" : "B";
+
+    await db.ref(`games/lemons/players/${lemId.current}`).set({
+      name: name || "匿名", studentId: studentId || "", role,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setLemRole(role);
+    setScreen("lem_intro");
+  };
+
+  const submitLemons = async (value) => {
+    if (!firebaseReady || !lemRound || lemSubmitted) return;
+    const v = parseInt(value);
+    if (isNaN(v) || v < 0 || v > 3000) { alert("请输入 0–3000 的整数 / Enter integer 0–3000"); return; }
+    await db.ref(`games/lemons/rounds/${lemRound}/submissions/${lemId.current}`).set({
+      role: lemRole, value: v, name: name || "匿名",
+      studentId: studentId || "",
+      // Sellers' car type stored too so matching can compute payoffs
+      carType: lemRole === "S" ? lemMyCarType : null,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setLemMyValue(v);
+    setLemSubmitted(true);
+  };
+
+  // ================================================================
+  // LEMONS — Teacher functions
+  // ================================================================
+  const lemStartRound = async (roundNum) => {
+    if (!firebaseReady) return;
+    const playersSnap = await db.ref("games/lemons/players").once("value");
+    const players = playersSnap.val() || {};
+    const sellerEntries = Object.entries(players).filter(([_, v]) => v.role === "S");
+    const buyerEntries = Object.entries(players).filter(([_, v]) => v.role === "B");
+    if (sellerEntries.length === 0) {
+      alert("没有 Seller / No sellers have joined yet!");
+      return;
+    }
+    if (buyerEntries.length === 0) {
+      alert("没有 Buyer / No buyers have joined yet!");
+      return;
+    }
+    const peachProb = lemNextPeachProb / 100;
+    const assignments = {};
+    for (const [sId] of sellerEntries) {
+      const carType = Math.random() < peachProb ? "peach" : "lemon";
+      assignments[sId] = { carType };
+    }
+
+    // In full-info mode, also pre-match each buyer to a random seller and reveal the type
+    let buyerMatches = null;
+    if (lemNextInfo === "full") {
+      buyerMatches = {};
+      const shuffledSellers = shuffle(sellerEntries.map(([sId]) => sId));
+      buyerEntries.forEach(([bId], i) => {
+        const sId = shuffledSellers[i % shuffledSellers.length];
+        buyerMatches[bId] = { sellerId: sId, carType: assignments[sId].carType };
+      });
+    }
+
+    const config = { info: lemNextInfo, peachProb };
+    const updates = {};
+    updates[`games/lemons/rounds/${roundNum}/assignments`] = assignments;
+    if (buyerMatches) updates[`games/lemons/rounds/${roundNum}/buyerMatches`] = buyerMatches;
+    updates[`games/lemons/state`] = { round: roundNum, phase: "playing", config };
+    await db.ref().update(updates);
+  };
+
+  const lemEndRound = async () => {
+    if (!firebaseReady || !lemRound) return;
+    const [subSnap, assignSnap, cfgSnap, bmSnap] = await Promise.all([
+      db.ref(`games/lemons/rounds/${lemRound}/submissions`).once("value"),
+      db.ref(`games/lemons/rounds/${lemRound}/assignments`).once("value"),
+      db.ref("games/lemons/state/config").once("value"),
+      db.ref(`games/lemons/rounds/${lemRound}/buyerMatches`).once("value"),
+    ]);
+    const subs = subSnap.val();
+    const assignments = assignSnap.val() || {};
+    const config = cfgSnap.val() || { info: "asym", peachProb: 0.5 };
+    const buyerMatches = bmSnap.val() || null; // present in full-info rounds
+    if (!subs) { alert("没有提交 / No submissions!"); return; }
+
+    const entries = Object.entries(subs);
+    const sellerSubs = entries.filter(([_, v]) => v.role === "S");
+    const buyerSubs = entries.filter(([_, v]) => v.role === "B");
+    const sellerMap = Object.fromEntries(sellerSubs);
+    const buyerMap = Object.fromEntries(buyerSubs);
+
+    if (sellerSubs.length === 0 || buyerSubs.length === 0) {
+      alert("需要至少一个 Seller 和一个 Buyer / Need at least one of each role!");
+      return;
+    }
+
+    const playerResults = {};
+    const matches = [];
+
+    // Helper: compute trade outcome for a (seller, buyer) pair
+    const computePair = (sId, sData, bId, bData) => {
+      const carType = assignments[sId]?.carType || sData.carType || "lemon";
+      const ask = sData.value;
+      const bid = bData.value;
+      const traded = bid >= ask;
+      const price = traded ? Math.round((bid + ask) / 2) : null;
+      const sVal = LEM_VALS[carType].seller;
+      const bVal = LEM_VALS[carType].buyer;
+      const sPay = traded ? (price - sVal) : 0;
+      const bPay = traded ? (bVal - price) : 0;
+      return { sId, bId, carType, ask, bid, traded, price, sPay, bPay, sVal, bVal, sName: sData.name, bName: bData.name };
+    };
+
+    if (config.info === "full" && buyerMatches) {
+      // FULL INFO: honor pre-assigned buyer→seller matches.
+      // Each buyer's outcome is canonical (their pre-matched seller).
+      // Each seller's outcome: if assigned by ≥1 submitting buyer, pick one of them; else pair randomly among submitting buyers (rare — only if their pre-matched buyer didn't show up at all, but we don't pre-match the seller side).
+      // Simplest faithful rule: buyer's match = pre-assigned. Seller's match = any submitting buyer that was pre-matched to them; if none, a random submitting buyer.
+      const sellerToBuyers = {}; // sId -> array of bIds that pre-matched to it AND submitted
+      for (const [bId, m] of Object.entries(buyerMatches)) {
+        if (buyerMap[bId]) {
+          (sellerToBuyers[m.sellerId] ||= []).push(bId);
+        }
+      }
+
+      // Buyer-side results
+      for (const [bId, bData] of buyerSubs) {
+        const m = buyerMatches[bId];
+        if (!m || !sellerMap[m.sellerId]) {
+          // Buyer's pre-matched seller didn't submit — pair with a random submitting seller
+          const [sId, sData] = sellerSubs[Math.floor(Math.random() * sellerSubs.length)];
+          const out = computePair(sId, sData, bId, bData);
+          matches.push(out);
+          playerResults[bId] = {
+            myRole: "B", myValue: out.bid, oppValue: out.ask, oppName: out.sName,
+            traded: out.traded, price: out.price, carType: out.carType,
+            myValuation: out.bVal, oppValuation: out.sVal,
+            myPayoff: out.bPay, oppPayoff: out.sPay, info: config.info,
+          };
+        } else {
+          const sId = m.sellerId;
+          const sData = sellerMap[sId];
+          const out = computePair(sId, sData, bId, bData);
+          matches.push(out);
+          playerResults[bId] = {
+            myRole: "B", myValue: out.bid, oppValue: out.ask, oppName: out.sName,
+            traded: out.traded, price: out.price, carType: out.carType,
+            myValuation: out.bVal, oppValuation: out.sVal,
+            myPayoff: out.bPay, oppPayoff: out.sPay, info: config.info,
+          };
+        }
+      }
+      // Seller-side results
+      for (const [sId, sData] of sellerSubs) {
+        const candidates = sellerToBuyers[sId] || [];
+        let bId, bData;
+        if (candidates.length > 0) {
+          bId = candidates[Math.floor(Math.random() * candidates.length)];
+          bData = buyerMap[bId];
+        } else {
+          [bId, bData] = buyerSubs[Math.floor(Math.random() * buyerSubs.length)];
+        }
+        const out = computePair(sId, sData, bId, bData);
+        // Only add to matches if this seller wasn't already represented from the buyer side
+        if (!matches.find(mm => mm.sId === sId && mm.bId === bId)) {
+          matches.push(out);
+        }
+        playerResults[sId] = {
+          myRole: "S", myValue: out.ask, oppValue: out.bid, oppName: out.bName,
+          traded: out.traded, price: out.price, carType: out.carType,
+          myValuation: out.sVal, oppValuation: out.bVal,
+          myPayoff: out.sPay, oppPayoff: out.bPay, info: config.info,
+        };
+      }
+    } else {
+      // ASYM INFO: random matching. Pair every seller with a random buyer; pair unmatched buyers with a random seller.
+      const shuffledBuyers = shuffle(buyerSubs);
+      for (const [sId, sData] of sellerSubs) {
+        const [bId, bData] = shuffledBuyers[Math.floor(Math.random() * shuffledBuyers.length)];
+        const out = computePair(sId, sData, bId, bData);
+        matches.push(out);
+        playerResults[sId] = {
+          myRole: "S", myValue: out.ask, oppValue: out.bid, oppName: out.bName,
+          traded: out.traded, price: out.price, carType: out.carType,
+          myValuation: out.sVal, oppValuation: out.bVal,
+          myPayoff: out.sPay, oppPayoff: out.bPay, info: config.info,
+        };
+      }
+      const matchedBuyerIds = new Set(matches.map(m => m.bId));
+      for (const [bId, bData] of buyerSubs) {
+        if (matchedBuyerIds.has(bId)) {
+          const m = matches.find(mm => mm.bId === bId);
+          playerResults[bId] = {
+            myRole: "B", myValue: m.bid, oppValue: m.ask, oppName: m.sName,
+            traded: m.traded, price: m.price, carType: m.carType,
+            myValuation: m.bVal, oppValuation: m.sVal,
+            myPayoff: m.bPay, oppPayoff: m.sPay, info: config.info,
+          };
+        } else {
+          const [sId, sData] = sellerSubs[Math.floor(Math.random() * sellerSubs.length)];
+          const out = computePair(sId, sData, bId, bData);
+          playerResults[bId] = {
+            myRole: "B", myValue: out.bid, oppValue: out.ask, oppName: out.sName,
+            traded: out.traded, price: out.price, carType: out.carType,
+            myValuation: out.bVal, oppValuation: out.sVal,
+            myPayoff: out.bPay, oppPayoff: out.sPay, info: config.info,
+          };
+        }
+      }
+    }
+
+    // Stats: split asks by car type
+    const peachAsks = sellerSubs.filter(([sId]) => (assignments[sId]?.carType) === "peach").map(([_, v]) => v.value);
+    const lemonAsks = sellerSubs.filter(([sId]) => (assignments[sId]?.carType) === "lemon").map(([_, v]) => v.value);
+    const bids = buyerSubs.map(([_, v]) => v.value);
+
+    const peachMatches = matches.filter(m => m.carType === "peach");
+    const lemonMatches = matches.filter(m => m.carType === "lemon");
+    const peachTraded = peachMatches.filter(m => m.traded).length;
+    const lemonTraded = lemonMatches.filter(m => m.traded).length;
+    const tradedAll = matches.filter(m => m.traded);
+    const avgPrice = tradedAll.length > 0
+      ? Math.round(tradedAll.reduce((a, m) => a + m.price, 0) / tradedAll.length)
+      : null;
+
+    const mean = arr => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null;
+    const median = arr => {
+      if (!arr.length) return null;
+      const s = [...arr].sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)];
+    };
+
+    const statsData = {
+      info: config.info,
+      peachProb: config.peachProb,
+      peachAsks, lemonAsks, bids,
+      avgPeachAsk: mean(peachAsks),
+      avgLemonAsk: mean(lemonAsks),
+      avgBid: mean(bids),
+      medianBid: median(bids),
+      sCount: sellerSubs.length,
+      bCount: buyerSubs.length,
+      peachCount: peachMatches.length,
+      lemonCount: lemonMatches.length,
+      peachTraded, lemonTraded,
+      peachTradeRate: peachMatches.length ? Math.round(peachTraded / peachMatches.length * 100) : 0,
+      lemonTradeRate: lemonMatches.length ? Math.round(lemonTraded / lemonMatches.length * 100) : 0,
+      avgPrice,
+      matches: matches.length,
+    };
+
+    const updates = {};
+    updates[`games/lemons/rounds/${lemRound}/playerResults`] = playerResults;
+    updates[`games/lemons/rounds/${lemRound}/stats`] = statsData;
+    updates["games/lemons/state/phase"] = "results";
+    await db.ref().update(updates);
+
+    await loadLemAllStats();
+    alert(`✅ Round ${lemRound} (${config.info === "full" ? "对称信息" : "非对称信息"}): ${sellerSubs.length}S × ${buyerSubs.length}B, peach trade=${statsData.peachTradeRate}%, lemon trade=${statsData.lemonTradeRate}%`);
+  };
+
+  const lemResetGame = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("Type 'reset' to confirm (will clear all Lemons data):");
+    if (pw !== "reset") return;
+    await db.ref("games/lemons").remove();
+    setLemPhase("lobby"); setLemRound(0); setLemSubmitted(false);
+    setLemMyValue(null); setLemMyResult(null); setLemAllStats([]);
+    setLemHistory([]); setLemRole(null); setLemInputValue("");
+    setLemMyCarType(null); setLemRoundConfig(null);
+    const newId = generateId();
+    lemId.current = newId;
+    try { localStorage.setItem("gt_lem_id", newId); } catch {}
+    alert("✅ 柠檬市场已重置 / Lemons Market reset!");
+  };
+
+  // ================================================================
   // GRADE GAME — Human matching (unchanged)
   // ================================================================
   const submitHuman = async (myChoice) => {
@@ -1215,17 +1658,29 @@ function App() {
           if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
           joinUltimatum();
         }}
-          style={{ width: "100%", padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #3A1820, #1F0F18)", border: `1px solid ${C.RED}40`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.RED}25`, marginBottom: 12 }}
+          style={{ width: "100%", padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #3A1820, #1F0F18)", border: `1px solid ${C.RED}40`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.RED}25`, marginBottom: 10 }}
           disabled={!firebaseReady}>
           <span style={{ fontSize: 18, marginRight: 8 }}>🤝</span>
           最后通牒博弈
           <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Ultimatum Bargaining · Week 7</span>
         </button>
 
+        {/* 6th game — Lemons Market (asymmetric info) */}
+        <button className="btn-press" onClick={() => {
+          if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
+          joinLemons();
+        }}
+          style={{ width: "100%", padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #2A2008, #1A1A05)", border: `1px solid ${C.GOLD}45`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.GOLD}25`, marginBottom: 12 }}
+          disabled={!firebaseReady}>
+          <span style={{ fontSize: 18, marginRight: 8 }}>🍋</span>
+          柠檬市场
+          <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Lemons Market · Asymmetric Info</span>
+        </button>
+
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn-press" onClick={() => {
             const pw = prompt("请输入教师密码:");
-            if (pw === "econ2501") { loadStats(); loadNashAllStats(); loadInvestAllResults(); loadUltAllStats(); setScreen("teacher"); }
+            if (pw === "econ2501") { loadStats(); loadNashAllStats(); loadInvestAllResults(); loadUltAllStats(); loadLemAllStats(); setScreen("teacher"); }
             else if (pw !== null) alert("密码错误");
           }}
             style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}35`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
@@ -2205,6 +2660,356 @@ function App() {
   }
 
   // ================================================================
+  // LEMONS MARKET — Player Screens
+  // ================================================================
+  if (screen === "lem_intro") {
+    const isPlaying = lemPhase === "playing" && lemRound > 0;
+    const isResults = lemPhase === "results" && lemRound > 0;
+
+    if (isPlaying && !lemSubmitted) return renderLemPlay();
+    if (isPlaying && lemSubmitted) return renderLemWait();
+    if (isResults && lemMyResult) return renderLemResult();
+    if (isResults && !lemMyResult) return renderLemWait();
+
+    const isSeller = lemRole === "S";
+    const roleColor = isSeller ? C.GOLD : C.TEAL;
+    const roleBg = isSeller ? "#2A2008" : C.TEAL_DARK;
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1A05)` }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>🍋</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>柠檬市场</h2>
+          <p style={{ fontSize: 13, color: C.GOLD, marginBottom: 20 }}>Lemons Market · Akerlof (1970)</p>
+
+          {/* Role badge */}
+          <div style={{ background: `linear-gradient(135deg, ${roleBg}, ${C.BG})`, border: `2px solid ${roleColor}60`, borderRadius: 14, padding: 16, marginBottom: 16 }}>
+            <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Your Role 你的角色</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color: roleColor, marginBottom: 4 }}>
+              {isSeller ? "🚗 Seller 卖家" : "💵 Buyer 买家"}
+            </div>
+            <div style={{ fontSize: 11, color: C.TEXT2 }}>
+              {isSeller
+                ? "You own a used car of unknown quality"
+                : "You consider buying a used car"}
+            </div>
+          </div>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", border: `1px solid ${C.GOLD}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>📋 规则 Rules</div>
+            <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7 }}>
+              <p style={{ marginBottom: 6 }}>市场上有两类二手车 / Two car types:</p>
+              <table style={{ width: "100%", fontSize: 11, marginBottom: 8, borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ background: `${C.SURFACE}` }}>
+                    <td style={{ padding: 6, color: C.DIM }}></td>
+                    <td style={{ padding: 6, color: C.TEXT2, textAlign: "right" }}>Seller value</td>
+                    <td style={{ padding: 6, color: C.TEXT2, textAlign: "right" }}>Buyer value</td>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr style={{ borderTop: `1px solid ${C.DIM}20` }}>
+                    <td style={{ padding: 6, color: C.GREEN }}>🍑 Peach 高质</td>
+                    <td style={{ padding: 6, color: C.TEXT, textAlign: "right" }}>2000</td>
+                    <td style={{ padding: 6, color: C.TEXT, textAlign: "right" }}>2400</td>
+                  </tr>
+                  <tr style={{ borderTop: `1px solid ${C.DIM}20` }}>
+                    <td style={{ padding: 6, color: C.AMBER }}>🍋 Lemon 次品</td>
+                    <td style={{ padding: 6, color: C.TEXT, textAlign: "right" }}>1000</td>
+                    <td style={{ padding: 6, color: C.TEXT, textAlign: "right" }}>1200</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p style={{ marginBottom: 4 }}>• <strong style={{ color: C.GOLD }}>Seller</strong> 提交 <em>ask</em> 价 (愿意接受的最低价).</p>
+              <p style={{ marginBottom: 4 }}>• <strong style={{ color: C.TEAL }}>Buyer</strong> 提交 <em>bid</em> 价 (愿意支付的最高价).</p>
+              <p style={{ marginBottom: 4 }}>• 随机 1:1 匹配。若 <strong>bid ≥ ask</strong> → 成交，价格 = (bid+ask)/2.</p>
+              <p>• 收益: Seller 得 (price − seller value); Buyer 得 (buyer value − price).</p>
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.GOLD}08`, border: `1px solid ${C.GOLD}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 4 }}>🔑 关键 Key</div>
+            <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+              {isSeller
+                ? "你会在每轮开始时被告知自己车的类型 (Peach 或 Lemon). 买家通常看不到 — 信息不对称。"
+                : "你通常看不到被分配的车型 — 只知道市场中两种车的比例。这就是关键不对称信息。"}
+            </div>
+          </Box>
+
+          <div style={{ background: `${C.GOLD}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.GOLD}20` }}>
+            <div style={{ width: 40, height: 40, margin: "0 auto 8px", border: `3px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 13, color: C.TEXT2 }}>等待老师开始... Waiting for teacher to start...</div>
+            <div style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>Sellers: {lemPlayerCounts.s} · Buyers: {lemPlayerCounts.b}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- LEMONS PLAY ----
+  function renderLemPlay() {
+    const isSeller = lemRole === "S";
+    const roleColor = isSeller ? C.GOLD : C.TEAL;
+    const v = parseInt(lemInputValue);
+    const valid = !isNaN(v) && v >= 0 && v <= 3000;
+
+    const cfg = lemRoundConfig || { info: "asym", peachProb: 0.5 };
+    const isFullInfo = cfg.info === "full";
+    const peachProb = cfg.peachProb;
+
+    // Sellers always see their own type. Buyers see type only if full-info round.
+    const carType = lemMyCarType;
+    const sellerVal = isSeller && carType ? LEM_VALS[carType].seller : null;
+
+    // Buyer's expected buyer-value under prior (asym info)
+    const expBuyerVal = peachProb * LEM_VALS.peach.buyer + (1 - peachProb) * LEM_VALS.lemon.buyer;
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1A05)` }}>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.GOLD, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {lemRound} · {isSeller ? "🚗 Seller" : "💵 Buyer"} · {isFullInfo ? "Full Info 对称" : "Asym Info 非对称"}
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>
+            {isSeller ? "你的最低售价 ask?" : "你的最高出价 bid?"}
+          </h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 16 }}>
+            {isSeller ? "Minimum ask price (0–3000)" : "Maximum bid price (0–3000)"}
+          </p>
+
+          {/* Private info card */}
+          {isSeller && carType && (
+            <Box style={{ marginBottom: 14, padding: 12, background: carType === "peach" ? `${C.GREEN}10` : `${C.AMBER}10`, border: `1px solid ${carType === "peach" ? C.GREEN : C.AMBER}40`, textAlign: "left" }}>
+              <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>Your Car (Private)</div>
+              <div style={{ fontSize: 18, fontWeight: 800, color: carType === "peach" ? C.GREEN : C.AMBER }}>
+                {carType === "peach" ? "🍑 Peach 高质" : "🍋 Lemon 次品"}
+              </div>
+              <div style={{ fontSize: 11, color: C.TEXT2, marginTop: 4 }}>
+                Your value (reservation): <strong style={{ color: C.TEXT }}>{sellerVal}</strong>
+                {" · "}Buyer's value: <strong style={{ color: C.TEXT }}>{LEM_VALS[carType].buyer}</strong>
+              </div>
+            </Box>
+          )}
+
+          {!isSeller && (
+            <Box style={{ marginBottom: 14, padding: 12, background: `${C.TEAL}08`, border: `1px solid ${C.TEAL}30`, textAlign: "left" }}>
+              <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>
+                {isFullInfo ? "Match Info (revealed this round)" : "Market Info (you only know this)"}
+              </div>
+              {isFullInfo && carType ? (
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: carType === "peach" ? C.GREEN : C.AMBER }}>
+                    Matched with {carType === "peach" ? "🍑 Peach" : "🍋 Lemon"}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.TEXT2, marginTop: 4 }}>
+                    Your value: <strong style={{ color: C.TEXT }}>{LEM_VALS[carType].buyer}</strong>
+                    {" · "}Seller's value: <strong style={{ color: C.TEXT }}>{LEM_VALS[carType].seller}</strong>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: 13, color: C.TEXT, lineHeight: 1.6 }}>
+                    Pr(🍑 Peach) = <strong style={{ color: C.GREEN }}>{Math.round(peachProb * 100)}%</strong>
+                    {" · "}Pr(🍋 Lemon) = <strong style={{ color: C.AMBER }}>{Math.round((1 - peachProb) * 100)}%</strong>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.TEXT2, marginTop: 6 }}>
+                    Expected value to you (random car): <strong style={{ color: C.TEAL }}>{Math.round(expBuyerVal)}</strong>
+                  </div>
+                  <div style={{ fontSize: 10, color: C.DIM, marginTop: 4, fontStyle: "italic" }}>
+                    But sellers know more than you — adverse selection ahead?
+                  </div>
+                </div>
+              )}
+            </Box>
+          )}
+
+          <Box style={{ marginBottom: 14, padding: 14 }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>
+              {isSeller ? "你的 ask 价 / Your ask" : "你的 bid 价 / Your bid"}
+            </div>
+            <input type="number" min="0" max="3000" step="50" value={lemInputValue}
+              onChange={e => setLemInputValue(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+              placeholder="0 – 3000"
+              style={{ width: "100%", padding: "14px 16px", fontSize: 28, fontWeight: 800, textAlign: "center", background: C.BG, border: `2px solid ${roleColor}40`, borderRadius: 12, color: roleColor, outline: "none" }}
+              onFocus={e => e.target.style.borderColor = roleColor}
+              onBlur={e => e.target.style.borderColor = `${roleColor}40`} />
+
+            <input type="range" min="0" max="3000" step="50" value={valid ? v : 1500}
+              onChange={e => setLemInputValue(e.target.value)}
+              style={{ width: "100%", marginTop: 12, accentColor: roleColor }} />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.DIM, marginTop: -4 }}>
+              <span>0</span><span>1000</span><span>1500</span><span>2000</span><span>3000</span>
+            </div>
+          </Box>
+
+          {/* Strategy preview */}
+          {valid && isSeller && carType && (
+            <Box style={{ marginBottom: 14, padding: 10, background: `${roleColor}08`, border: `1px solid ${roleColor}20`, textAlign: "left", fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+              卖出最低价 <strong style={{ color: roleColor }}>{v}</strong>. 若成交于 <em>p</em>, 收益 = <strong style={{ color: C.GREEN }}>p − {sellerVal}</strong>.
+              {v < sellerVal && <div style={{ color: C.RED, marginTop: 4 }}>⚠️ Ask &lt; your value: you'd lose if traded.</div>}
+            </Box>
+          )}
+          {valid && !isSeller && (
+            <Box style={{ marginBottom: 14, padding: 10, background: `${roleColor}08`, border: `1px solid ${roleColor}20`, textAlign: "left", fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+              出价最高 <strong style={{ color: roleColor }}>{v}</strong>. 若成交于 <em>p</em>, 收益 = <strong style={{ color: C.GREEN }}>buyer value − p</strong>.
+            </Box>
+          )}
+
+          <button className="btn-press" onClick={() => submitLemons(lemInputValue)} disabled={!valid}
+            style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 800, background: valid ? `linear-gradient(135deg, ${roleColor}, ${isSeller ? "#8A6A2A" : "#2A6A66"})` : C.SURFACE, border: "none", borderRadius: 12, color: valid ? "#0F0F0F" : C.DIM, cursor: valid ? "pointer" : "not-allowed", boxShadow: valid ? `0 6px 24px ${roleColor}30` : "none" }}>
+            ✓ 提交 / Submit
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- LEMONS WAIT ----
+  function renderLemWait() {
+    const isSeller = lemRole === "S";
+    const roleColor = isSeller ? C.GOLD : C.TEAL;
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1A05)` }}>
+        <div style={{ textAlign: "center", maxWidth: 360 }}>
+          <div style={{ width: 50, height: 50, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+          <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待匹配...</h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 14 }}>Round {lemRound} · Waiting for matching</p>
+          <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${roleColor}30`, marginBottom: 12 }}>
+            <div style={{ fontSize: 10, color: C.DIM }}>Your {isSeller ? "ask" : "bid"}</div>
+            <div style={{ fontSize: 32, fontWeight: 800, color: roleColor }}>{lemMyValue}</div>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Box style={{ flex: 1, textAlign: "center", padding: 10 }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>Sellers 提交</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: C.GOLD }}>{lemSubCounts.s}</div>
+            </Box>
+            <Box style={{ flex: 1, textAlign: "center", padding: 10 }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>Buyers 提交</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: C.TEAL }}>{lemSubCounts.b}</div>
+            </Box>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- LEMONS RESULT ----
+  function renderLemResult() {
+    const r = lemMyResult;
+    if (!r) return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: `linear-gradient(165deg, ${C.BG}, #1A1A05)` }}>
+        <div style={{ width: 40, height: 40, border: `3px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      </div>
+    );
+
+    const isSeller = r.myRole === "S";
+    const roleColor = isSeller ? C.GOLD : C.TEAL;
+    const bgTint = r.traded ? "#0B200F" : "#200B0B";
+    const stats = lemRoundStats;
+
+    return (
+      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, ${bgTint})`, overflowY: "auto" }}>
+        <div style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
+          <div className="fade-up" style={{ fontSize: 48, marginBottom: 8 }}>
+            {r.traded ? "🤝" : "🚫"}
+          </div>
+          <h2 className="fade-up fade-up-1" style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>
+            {r.traded ? "成交! Trade!" : "未成交 No Trade"}
+          </h2>
+          <p className="fade-up fade-up-1" style={{ fontSize: 13, color: r.traded ? C.GREEN : C.RED, marginBottom: 20 }}>
+            Round {lemRound} · {isSeller ? "你是 Seller" : "你是 Buyer"} · {r.info === "full" ? "对称信息" : "非对称信息"}
+          </p>
+
+          {/* Match breakdown */}
+          <Box className="fade-up fade-up-2" style={{ marginBottom: 14, padding: 14, textAlign: "left", border: `1px solid ${roleColor}30` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: roleColor, marginBottom: 10 }}>🎯 你的匹配 Your Match</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 13, marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM }}>{isSeller ? "你的 ask" : "你的 bid"}</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: roleColor }}>{r.myValue}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM }}>{isSeller ? "对方 bid" : "对方 ask"}</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: C.TEXT2 }}>{r.oppValue}</div>
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: C.TEXT2, fontFamily: "monospace", paddingTop: 8, borderTop: `1px solid ${C.DIM}20` }}>
+              {isSeller
+                ? `bid=${r.oppValue} ${r.traded ? "≥" : "<"} ask=${r.myValue} → ${r.traded ? `TRADE @ ${r.price}` : "NO TRADE"}`
+                : `bid=${r.myValue} ${r.traded ? "≥" : "<"} ask=${r.oppValue} → ${r.traded ? `TRADE @ ${r.price}` : "NO TRADE"}`}
+            </div>
+            <div style={{ fontSize: 11, color: C.DIM, marginTop: 6 }}>
+              对手 Partner: <span style={{ color: C.TEXT }}>{r.oppName}</span>
+              {" · "}Car: <span style={{ color: r.carType === "peach" ? C.GREEN : C.AMBER }}>
+                {r.carType === "peach" ? "🍑 Peach (2000/2400)" : "🍋 Lemon (1000/1200)"}
+              </span>
+            </div>
+          </Box>
+
+          {/* Payoffs */}
+          <div className="fade-up fade-up-2" style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+            <Box style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>你的收益 Your payoff</div>
+              <div style={{ fontSize: 30, fontWeight: 800, color: r.myPayoff > 0 ? C.GREEN : (r.myPayoff < 0 ? C.RED : C.DIM) }}>
+                {r.myPayoff > 0 ? "+" : ""}{r.myPayoff}
+              </div>
+            </Box>
+            <Box style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>对方收益 Their payoff</div>
+              <div style={{ fontSize: 30, fontWeight: 800, color: r.oppPayoff > 0 ? C.GREEN : (r.oppPayoff < 0 ? C.RED : C.DIM) }}>
+                {r.oppPayoff > 0 ? "+" : ""}{r.oppPayoff}
+              </div>
+            </Box>
+          </div>
+
+          {/* Class-wide stats by car type */}
+          {stats && (
+            <Box className="fade-up fade-up-3" style={{ marginBottom: 14, padding: 14, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>📊 班级结果 Class Outcomes</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 11 }}>
+                <div style={{ background: `${C.GREEN}10`, padding: 8, borderRadius: 8, border: `1px solid ${C.GREEN}25` }}>
+                  <div style={{ color: C.GREEN, fontWeight: 700, marginBottom: 4 }}>🍑 Peaches (n={stats.peachCount})</div>
+                  <div style={{ color: C.TEXT2 }}>Avg ask: <strong style={{ color: C.TEXT }}>{stats.avgPeachAsk ?? "—"}</strong></div>
+                  <div style={{ color: C.TEXT2 }}>Trade rate: <strong style={{ color: stats.peachTradeRate >= 50 ? C.GREEN : C.RED }}>{stats.peachTradeRate}%</strong></div>
+                </div>
+                <div style={{ background: `${C.AMBER}10`, padding: 8, borderRadius: 8, border: `1px solid ${C.AMBER}25` }}>
+                  <div style={{ color: C.AMBER, fontWeight: 700, marginBottom: 4 }}>🍋 Lemons (n={stats.lemonCount})</div>
+                  <div style={{ color: C.TEXT2 }}>Avg ask: <strong style={{ color: C.TEXT }}>{stats.avgLemonAsk ?? "—"}</strong></div>
+                  <div style={{ color: C.TEXT2 }}>Trade rate: <strong style={{ color: stats.lemonTradeRate >= 50 ? C.GREEN : C.RED }}>{stats.lemonTradeRate}%</strong></div>
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: C.TEXT2, marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.DIM}20` }}>
+                Avg bid: <strong style={{ color: C.TEAL }}>{stats.avgBid ?? "—"}</strong>
+                {stats.avgPrice != null && <> · Avg trade price: <strong style={{ color: C.TEXT }}>{stats.avgPrice}</strong></>}
+              </div>
+            </Box>
+          )}
+
+          {/* Pedagogical punchline */}
+          {stats && (
+            <Box className="fade-up fade-up-3" style={{ marginBottom: 16, padding: 14, background: `${C.GOLD}08`, border: `1px solid ${C.GOLD}25`, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 6 }}>🎓 Akerlof 预测</div>
+              <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.7 }}>
+                {stats.info === "full" ? (
+                  <>对称信息下，efficient trade: 两类车都应成交 (gains 400 / 200). 你的班级达到了吗?</>
+                ) : (
+                  <>非对称信息下，buyers 不知道 car type, 出价反映 prior 平均估值 ≈ <strong style={{ color: C.TEAL }}>{Math.round(stats.peachProb * 2400 + (1 - stats.peachProb) * 1200)}</strong>. Peach 卖家 (value 2000) 不愿 sell at this price → market unraveling. 只有 lemons trade.</>
+                )}
+              </div>
+            </Box>
+          )}
+
+          <div style={{ background: `${C.GOLD}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.GOLD}20` }}>
+            <div style={{ width: 30, height: 30, margin: "0 auto 8px", border: `2px solid ${C.DIM}30`, borderTopColor: C.GOLD, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 12, color: C.TEXT2 }}>等待下一轮... Waiting for next round...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ================================================================
   // TEACHER PANEL
   // ================================================================
   if (screen === "teacher") {
@@ -2220,9 +3025,9 @@ function App() {
 
           {/* Tab switcher */}
           <div style={{ display: "flex", gap: 4, marginBottom: 20, flexWrap: "wrap" }}>
-            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }].map(t => (
-              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); }}
-                style={{ flex: "1 1 80px", padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
+            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }, { id: "lemons", label: "🍋 柠檬" }].map(t => (
+              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); if (t.id === "lemons") loadLemAllStats(); }}
+                style={{ flex: "1 1 70px", padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
                 {t.label}
               </button>
             ))}
@@ -2618,6 +3423,229 @@ function App() {
                 🔄 刷新数据 Refresh
               </button>
             </div>
+            );
+          })()}
+
+          {teacherTab === "lemons" && (() => {
+            const latest = lemAllStats.length > 0 ? lemAllStats[lemAllStats.length - 1] : null;
+            // Histogram helper for ask prices (0–3000, 12 bins of 250)
+            const NBINS = 12;
+            const BINW = 3000 / NBINS;
+            const makeAskHist = (raw) => {
+              // Firebase may return arrays as objects with numeric keys; coerce to array of numbers
+              const values = raw == null ? [] : (Array.isArray(raw) ? raw : Object.values(raw));
+              const counts = Array(NBINS).fill(0);
+              values.forEach(v => {
+                if (typeof v !== "number") return;
+                const idx = Math.min(Math.floor(v / BINW), NBINS - 1);
+                counts[idx]++;
+              });
+              return counts;
+            };
+            const peachHist = latest ? makeAskHist(latest.peachAsks) : null;
+            const lemonHist = latest ? makeAskHist(latest.lemonAsks) : null;
+            const bidHist = latest ? makeAskHist(latest.bids) : null;
+            const maxBin = Math.max(
+              ...(peachHist || [1]), ...(lemonHist || [1]), ...(bidHist || [1]), 1
+            );
+            return (
+              <div>
+                {/* Status */}
+                <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>轮次 Round</div>
+                    <div style={{ fontSize: 32, fontWeight: 800, color: C.GOLD }}>{lemRound || "—"}</div>
+                  </Box>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>阶段 Phase</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: lemPhase === "playing" ? C.GREEN : lemPhase === "results" ? C.GOLD : C.DIM, marginTop: 6 }}>
+                      {lemPhase === "playing" ? "进行中" : lemPhase === "results" ? "已揭晓" : "等待中"}
+                    </div>
+                    {lemRoundConfig && (
+                      <div style={{ fontSize: 10, color: C.TEXT2, marginTop: 2 }}>
+                        {lemRoundConfig.info === "full" ? "Full info" : `Asym (Pr🍑=${Math.round(lemRoundConfig.peachProb * 100)}%)`}
+                      </div>
+                    )}
+                  </Box>
+                </div>
+
+                {/* Role counts */}
+                <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                  <Box style={{ flex: 1, textAlign: "center", border: `1px solid ${C.GOLD}20` }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>🚗 Sellers</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: C.GOLD }}>{lemPlayerCounts.s}</div>
+                    {lemPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>已交: {lemSubCounts.s}</div>}
+                  </Box>
+                  <Box style={{ flex: 1, textAlign: "center", border: `1px solid ${C.TEAL}20` }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>💵 Buyers</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: C.TEAL }}>{lemPlayerCounts.b}</div>
+                    {lemPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>已交: {lemSubCounts.b}</div>}
+                  </Box>
+                </div>
+
+                {/* Round-config controls (only when not playing) */}
+                {(lemPhase === "lobby" || lemPhase === "results") && (
+                  <Box style={{ marginBottom: 14, padding: 12, background: `${C.GOLD}06`, border: `1px solid ${C.GOLD}25`, textAlign: "left" }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>下一轮设置 / Next Round Setup</div>
+
+                    <div style={{ fontSize: 11, color: C.TEXT2, marginBottom: 4 }}>Information structure:</div>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                      <button onClick={() => setLemNextInfo("full")}
+                        style={{ flex: 1, padding: 8, fontSize: 11, fontWeight: 700, background: lemNextInfo === "full" ? `${C.GREEN}25` : "transparent", border: `1px solid ${lemNextInfo === "full" ? C.GREEN : C.DIM}40`, borderRadius: 8, color: lemNextInfo === "full" ? C.GREEN : C.TEXT2, cursor: "pointer" }}>
+                        Full Info 对称
+                      </button>
+                      <button onClick={() => setLemNextInfo("asym")}
+                        style={{ flex: 1, padding: 8, fontSize: 11, fontWeight: 700, background: lemNextInfo === "asym" ? `${C.RED}25` : "transparent", border: `1px solid ${lemNextInfo === "asym" ? C.RED : C.DIM}40`, borderRadius: 8, color: lemNextInfo === "asym" ? C.RED : C.TEXT2, cursor: "pointer" }}>
+                        Asym Info 非对称
+                      </button>
+                    </div>
+
+                    <div style={{ fontSize: 11, color: C.TEXT2, marginBottom: 4 }}>
+                      Peach prior: <strong style={{ color: C.GREEN }}>{lemNextPeachProb}%</strong>
+                      {" · "}Lemon: <strong style={{ color: C.AMBER }}>{100 - lemNextPeachProb}%</strong>
+                    </div>
+                    <input type="range" min="0" max="100" step="5" value={lemNextPeachProb}
+                      onChange={e => setLemNextPeachProb(parseInt(e.target.value))}
+                      style={{ width: "100%", accentColor: C.GREEN }} />
+                  </Box>
+                )}
+
+                {/* Controls */}
+                <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                  {(lemPhase === "lobby" || lemPhase === "results") && (
+                    <button className="btn-press" onClick={() => lemStartRound((lemRound || 0) + 1)}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A2008, #1A1A05)`, border: `1px solid ${C.GOLD}50`, borderRadius: 12, color: C.GOLD, cursor: "pointer" }}>
+                      ▶️ {lemRound ? `开始第 ${lemRound + 1} 轮` : "开始第 1 轮"}
+                    </button>
+                  )}
+                  {lemPhase === "playing" && (
+                    <button className="btn-press" onClick={lemEndRound}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A0F, #1A1008)`, border: `1px solid ${C.AMBER}50`, borderRadius: 12, color: C.AMBER, cursor: "pointer" }}>
+                      ⏹️ 结束 & 匹配
+                    </button>
+                  )}
+                  <button className="btn-press" onClick={lemResetGame}
+                    style={{ padding: 14, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                    🗑️
+                  </button>
+                </div>
+
+                {/* Latest round histogram */}
+                {latest && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.GOLD}20` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>
+                      📊 第 {latest.round} 轮 / Round {latest.round}
+                      {" · "}<span style={{ color: latest.info === "full" ? C.GREEN : C.RED }}>
+                        {latest.info === "full" ? "Full info" : "Asym info"}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 12, fontSize: 10, marginBottom: 6 }}>
+                      <span style={{ color: C.GREEN }}>■ Peach asks (μ={latest.avgPeachAsk ?? "—"})</span>
+                      <span style={{ color: C.AMBER }}>■ Lemon asks (μ={latest.avgLemonAsk ?? "—"})</span>
+                      <span style={{ color: C.TEAL }}>■ Bids (μ={latest.avgBid ?? "—"})</span>
+                    </div>
+                    <svg viewBox="0 0 360 170" style={{ width: "100%" }}>
+                      {/* Reference lines at key valuations */}
+                      <line x1={20 + (1000 / 3000) * 320} y1={10} x2={20 + (1000 / 3000) * 320} y2={140} stroke={C.AMBER} strokeWidth="1" strokeDasharray="2,2" opacity="0.5" />
+                      <line x1={20 + (1200 / 3000) * 320} y1={10} x2={20 + (1200 / 3000) * 320} y2={140} stroke={C.AMBER} strokeWidth="1" strokeDasharray="2,2" opacity="0.5" />
+                      <line x1={20 + (2000 / 3000) * 320} y1={10} x2={20 + (2000 / 3000) * 320} y2={140} stroke={C.GREEN} strokeWidth="1" strokeDasharray="2,2" opacity="0.5" />
+                      <line x1={20 + (2400 / 3000) * 320} y1={10} x2={20 + (2400 / 3000) * 320} y2={140} stroke={C.GREEN} strokeWidth="1" strokeDasharray="2,2" opacity="0.5" />
+                      {/* X-axis ticks */}
+                      {[0, 1000, 1500, 2000, 2500, 3000].map(tick => (
+                        <g key={tick}>
+                          <text x={20 + (tick / 3000) * 320} y={155} textAnchor="middle" fontSize="9" fill={C.DIM}>{tick}</text>
+                        </g>
+                      ))}
+                      {/* Bars (3-way overlay) */}
+                      {peachHist && peachHist.map((c, i) => {
+                        const x = 20 + i * (320 / NBINS);
+                        const w = (320 / NBINS) / 3.5;
+                        const h = (c / maxBin) * 120;
+                        return c > 0 ? <rect key={`p${i}`} x={x} y={140 - h} width={w} height={h} fill={C.GREEN} opacity="0.85" /> : null;
+                      })}
+                      {lemonHist && lemonHist.map((c, i) => {
+                        const x = 20 + i * (320 / NBINS) + (320 / NBINS) / 3.5;
+                        const w = (320 / NBINS) / 3.5;
+                        const h = (c / maxBin) * 120;
+                        return c > 0 ? <rect key={`l${i}`} x={x} y={140 - h} width={w} height={h} fill={C.AMBER} opacity="0.85" /> : null;
+                      })}
+                      {bidHist && bidHist.map((c, i) => {
+                        const x = 20 + i * (320 / NBINS) + 2 * (320 / NBINS) / 3.5;
+                        const w = (320 / NBINS) / 3.5;
+                        const h = (c / maxBin) * 120;
+                        return c > 0 ? <rect key={`b${i}`} x={x} y={140 - h} width={w} height={h} fill={C.TEAL} opacity="0.85" /> : null;
+                      })}
+                      {/* Reference labels */}
+                      <text x={20 + (1000 / 3000) * 320} y={12} textAnchor="middle" fontSize="7" fill={C.AMBER}>L_s=1000</text>
+                      <text x={20 + (2000 / 3000) * 320} y={12} textAnchor="middle" fontSize="7" fill={C.GREEN}>P_s=2000</text>
+                    </svg>
+
+                    {/* Trade rate by type */}
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.DIM}20`, fontSize: 10 }}>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ color: C.GREEN }}>🍑 Peach trade</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: latest.peachTradeRate >= 50 ? C.GREEN : C.RED }}>
+                          {latest.peachTradeRate}%
+                        </div>
+                        <div style={{ color: C.DIM }}>{latest.peachTraded}/{latest.peachCount}</div>
+                      </div>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ color: C.AMBER }}>🍋 Lemon trade</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: latest.lemonTradeRate >= 50 ? C.GREEN : C.RED }}>
+                          {latest.lemonTradeRate}%
+                        </div>
+                        <div style={{ color: C.DIM }}>{latest.lemonTraded}/{latest.lemonCount}</div>
+                      </div>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ color: C.TEXT2 }}>Avg price</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: C.TEXT }}>
+                          {latest.avgPrice ?? "—"}
+                        </div>
+                        <div style={{ color: C.DIM }}>n={latest.matches}</div>
+                      </div>
+                    </div>
+                  </Box>
+                )}
+
+                {/* Multi-round summary */}
+                {lemAllStats.length > 0 && (
+                  <Box>
+                    <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>各轮对比 / Round-by-round</div>
+                    <table style={{ width: "100%", fontSize: 10, borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.DIM }}>R</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.DIM }}>Info</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.GREEN }}>🍑 ask</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.AMBER }}>🍋 ask</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.TEAL }}>μ Bid</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.GREEN }}>🍑 %</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.AMBER }}>🍋 %</td>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {lemAllStats.map((s, i) => (
+                          <tr key={i} style={{ borderTop: `1px solid ${C.DIM}15` }}>
+                            <td style={{ padding: 3, color: C.TEXT }}>{s.round}</td>
+                            <td style={{ padding: 3, color: s.info === "full" ? C.GREEN : C.RED }}>
+                              {s.info === "full" ? "F" : "A"}
+                            </td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.avgPeachAsk ?? "—"}</td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.avgLemonAsk ?? "—"}</td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.avgBid ?? "—"}</td>
+                            <td style={{ padding: 3, color: s.peachTradeRate >= 50 ? C.GREEN : C.RED, fontWeight: 700 }}>{s.peachTradeRate}%</td>
+                            <td style={{ padding: 3, color: s.lemonTradeRate >= 50 ? C.GREEN : C.RED, fontWeight: 700 }}>{s.lemonTradeRate}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Box>
+                )}
+
+                <button className="btn-press" onClick={loadLemAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 12 }}>
+                  🔄 刷新数据 Refresh
+                </button>
+              </div>
             );
           })()}
         </div>
