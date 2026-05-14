@@ -299,6 +299,22 @@ function App() {
   const [lemNextInfo, setLemNextInfo] = useState("asym"); // "full" | "asym"
   const [lemNextPeachProb, setLemNextPeachProb] = useState(50); // percent
 
+  // ---- AUCTION (Pure Common-Value, First-Price Sealed-Bid) ----
+  // Bag: 10 cards drawn i.i.d. with replacement from {1..10}. V = sum (range [10,100], E[V]=55).
+  // Each player privately sees 2 of those 10 cards (uniform without replacement per player; with replacement across players).
+  // First-price sealed-bid: highest bid wins, pays own bid, payoff = V - bid.
+  const [auctPhase, setAuctPhase] = useState("lobby"); // "lobby" | "playing" | "results"
+  const [auctRound, setAuctRound] = useState(0);
+  const [auctMySignal, setAuctMySignal] = useState(null); // [c1, c2]
+  const [auctSubmitted, setAuctSubmitted] = useState(false);
+  const [auctMyBid, setAuctMyBid] = useState(null);
+  const [auctInputValue, setAuctInputValue] = useState("");
+  const [auctMyResult, setAuctMyResult] = useState(null);
+  const [auctPlayerCount, setAuctPlayerCount] = useState(0);
+  const [auctSubCount, setAuctSubCount] = useState(0);
+  const [auctRoundStats, setAuctRoundStats] = useState(null);
+  const [auctAllStats, setAuctAllStats] = useState([]);
+
   const game = GAMES[gameId];
   const myId = useRef(generateId());
   const nashId = useRef(() => {
@@ -328,6 +344,16 @@ function App() {
       let id = localStorage.getItem("gt_lem_id");
       if (!id) { id = generateId(); localStorage.setItem("gt_lem_id", id); }
       lemId.current = id;
+    } catch {}
+  }, []);
+
+  const auctId = useRef(generateId());
+  // Initialize persistent auction ID from localStorage
+  useEffect(() => {
+    try {
+      let id = localStorage.getItem("gt_auct_id");
+      if (!id) { id = generateId(); localStorage.setItem("gt_auct_id", id); }
+      auctId.current = id;
     } catch {}
   }, []);
 
@@ -1361,6 +1387,249 @@ function App() {
   };
 
   // ================================================================
+  // AUCTION (Common-Value, First-Price Sealed-Bid) — Firebase listeners
+  // ================================================================
+  const auctListenersRef = useRef([]);
+
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const stateRef = db.ref("games/auction/state");
+    const onState = stateRef.on("value", (snap) => {
+      const s = snap.val();
+      if (!s) { setAuctPhase("lobby"); setAuctRound(0); return; }
+      setAuctPhase(s.phase || "lobby");
+      setAuctRound(s.round || 0);
+    });
+    auctListenersRef.current.push(() => stateRef.off("value", onState));
+
+    const playersRef = db.ref("games/auction/players");
+    const onPlayers = playersRef.on("value", (snap) => {
+      const p = snap.val() || {};
+      setAuctPlayerCount(Object.keys(p).length);
+    });
+    auctListenersRef.current.push(() => playersRef.off("value", onPlayers));
+
+    return () => auctListenersRef.current.forEach(off => off());
+  }, [firebaseReady]);
+
+  // Submission count in current round
+  useEffect(() => {
+    if (!firebaseReady || !auctRound) return;
+    const subRef = db.ref(`games/auction/rounds/${auctRound}/submissions`);
+    const onSub = subRef.on("value", (snap) => {
+      const s = snap.val() || {};
+      setAuctSubCount(Object.keys(s).length);
+    });
+    return () => subRef.off("value", onSub);
+  }, [firebaseReady, auctRound]);
+
+  // My private signal when round starts
+  useEffect(() => {
+    if (!firebaseReady || auctPhase !== "playing" || !auctRound) return;
+    const sigRef = db.ref(`games/auction/rounds/${auctRound}/signals/${auctId.current}`);
+    sigRef.once("value", (snap) => {
+      const s = snap.val();
+      if (s && Array.isArray(s.cards)) setAuctMySignal(s.cards);
+    });
+  }, [firebaseReady, auctPhase, auctRound]);
+
+  // My result when phase = results
+  useEffect(() => {
+    if (!firebaseReady || auctPhase !== "results" || !auctRound) return;
+    const resRef = db.ref(`games/auction/rounds/${auctRound}/playerResults/${auctId.current}`);
+    resRef.once("value", (snap) => {
+      const r = snap.val();
+      if (r) setAuctMyResult(r);
+    });
+    const statsRef = db.ref(`games/auction/rounds/${auctRound}/stats`);
+    statsRef.once("value", (snap) => {
+      const s = snap.val();
+      if (s) {
+        setAuctRoundStats(s);
+        setAuctAllStats(prev => {
+          const filtered = prev.filter(x => x.round !== auctRound);
+          return [...filtered, { round: auctRound, ...s }].sort((a, b) => a.round - b.round);
+        });
+      }
+    });
+  }, [firebaseReady, auctPhase, auctRound]);
+
+  // Reset per-round transient state when new round starts
+  useEffect(() => {
+    if (auctPhase === "playing") {
+      setAuctSubmitted(false);
+      setAuctMyBid(null);
+      setAuctMyResult(null);
+      setAuctRoundStats(null);
+      setAuctInputValue("");
+      setAuctMySignal(null);
+    }
+  }, [auctPhase, auctRound]);
+
+  const loadAuctAllStats = async () => {
+    if (!firebaseReady) return;
+    const snap = await db.ref("games/auction/rounds").once("value");
+    const rounds = snap.val() || {};
+    const allStats = [];
+    for (const [rNum, rData] of Object.entries(rounds)) {
+      if (rData.stats) allStats.push({ round: parseInt(rNum), ...rData.stats });
+    }
+    setAuctAllStats(allStats.sort((a, b) => a.round - b.round));
+  };
+
+  // ================================================================
+  // AUCTION — Player functions
+  // ================================================================
+  const joinAuction = async () => {
+    if (!firebaseReady) return;
+    const existSnap = await db.ref(`games/auction/players/${auctId.current}`).once("value");
+    if (existSnap.val()) {
+      setScreen("auct_intro");
+      return;
+    }
+    await db.ref(`games/auction/players/${auctId.current}`).set({
+      name: name || "匿名", studentId: studentId || "",
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setScreen("auct_intro");
+  };
+
+  const submitAuctBid = async (value) => {
+    if (!firebaseReady || !auctRound || auctSubmitted) return;
+    const v = parseInt(value);
+    if (isNaN(v) || v < 0 || v > 100) { alert("请输入 0–100 的整数 / Enter integer 0–100"); return; }
+    await db.ref(`games/auction/rounds/${auctRound}/submissions/${auctId.current}`).set({
+      bid: v, name: name || "匿名", studentId: studentId || "",
+      signal: auctMySignal || null,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setAuctMyBid(v);
+    setAuctSubmitted(true);
+  };
+
+  // ================================================================
+  // AUCTION — Teacher functions
+  // ================================================================
+  const auctStartRound = async (roundNum) => {
+    if (!firebaseReady) return;
+    const playersSnap = await db.ref("games/auction/players").once("value");
+    const players = playersSnap.val() || {};
+    const playerIds = Object.keys(players);
+    if (playerIds.length === 0) {
+      alert("没有玩家 / No players have joined yet!");
+      return;
+    }
+
+    // Draw the bag: 10 cards i.i.d. with replacement from {1..10}
+    const bag = [];
+    for (let i = 0; i < 10; i++) bag.push(1 + Math.floor(Math.random() * 10));
+    const V = bag.reduce((a, b) => a + b, 0);
+
+    // Each player: 2 distinct cards sampled uniformly from the 10-card bag (without replacement per player; with replacement across players)
+    const signals = {};
+    for (const pid of playerIds) {
+      const i1 = Math.floor(Math.random() * 10);
+      let i2 = Math.floor(Math.random() * 9);
+      if (i2 >= i1) i2 += 1; // pick a different index
+      signals[pid] = { cards: [bag[i1], bag[i2]], indices: [i1, i2] };
+    }
+
+    const updates = {};
+    updates[`games/auction/rounds/${roundNum}/bag`] = bag;
+    updates[`games/auction/rounds/${roundNum}/V`] = V;
+    updates[`games/auction/rounds/${roundNum}/signals`] = signals;
+    updates[`games/auction/state`] = { round: roundNum, phase: "playing" };
+    await db.ref().update(updates);
+  };
+
+  const auctEndRound = async () => {
+    if (!firebaseReady || !auctRound) return;
+    const [subSnap, vSnap, bagSnap] = await Promise.all([
+      db.ref(`games/auction/rounds/${auctRound}/submissions`).once("value"),
+      db.ref(`games/auction/rounds/${auctRound}/V`).once("value"),
+      db.ref(`games/auction/rounds/${auctRound}/bag`).once("value"),
+    ]);
+    const subs = subSnap.val();
+    const V = vSnap.val();
+    const bag = bagSnap.val() || [];
+    if (!subs) { alert("没有提交 / No submissions!"); return; }
+
+    const entries = Object.entries(subs);
+    // Find highest bid; ties broken uniformly at random
+    const maxBid = Math.max(...entries.map(([_, v]) => v.bid));
+    const topEntries = entries.filter(([_, v]) => v.bid === maxBid);
+    const [winnerId, winnerData] = topEntries[Math.floor(Math.random() * topEntries.length)];
+
+    const playerResults = {};
+    for (const [pid, sub] of entries) {
+      const isWinner = pid === winnerId;
+      const payoff = isWinner ? (V - sub.bid) : 0;
+      playerResults[pid] = {
+        myBid: sub.bid,
+        mySignal: sub.signal || null,
+        mySignalSum: sub.signal ? sub.signal[0] + sub.signal[1] : null,
+        myNaiveEst: sub.signal ? 5 * (sub.signal[0] + sub.signal[1]) : null,
+        isWinner, payoff, V, bag,
+        winnerName: winnerData.name, winnerBid: winnerData.bid,
+        winnerSignal: winnerData.signal || null,
+        nBidders: entries.length,
+      };
+    }
+
+    // Aggregate stats
+    const bids = entries.map(([_, v]) => v.bid);
+    const signalSums = entries.map(([_, v]) => v.signal ? v.signal[0] + v.signal[1] : null).filter(x => x != null);
+    const naiveEsts = signalSums.map(s => 5 * s);
+    const mean = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+    const median = arr => {
+      if (!arr.length) return null;
+      const s = [...arr].sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)];
+    };
+    const winnerPayoff = V - maxBid;
+
+    const statsData = {
+      V, bag, bids,
+      nBidders: entries.length,
+      avgBid: mean(bids) != null ? Math.round(mean(bids) * 10) / 10 : null,
+      medianBid: median(bids),
+      maxBid, minBid: Math.min(...bids),
+      winnerName: winnerData.name,
+      winnerBid: maxBid,
+      winnerSignal: winnerData.signal || null,
+      winnerPayoff,
+      avgNaiveEst: mean(naiveEsts) != null ? Math.round(mean(naiveEsts) * 10) / 10 : null,
+      // For the winner's curse panel: did the winner overpay vs V?
+      overpaid: maxBid > V,
+    };
+
+    const updates = {};
+    updates[`games/auction/rounds/${auctRound}/playerResults`] = playerResults;
+    updates[`games/auction/rounds/${auctRound}/stats`] = statsData;
+    updates["games/auction/state/phase"] = "results";
+    await db.ref().update(updates);
+
+    await loadAuctAllStats();
+    const cursePhrase = winnerPayoff < 0 ? "🩸 winner's curse" : winnerPayoff > 0 ? "🟢 profit" : "😐 break-even";
+    alert(`✅ Round ${auctRound}: V=${V}, winner=${winnerData.name} bid ${maxBid}, payoff ${winnerPayoff > 0 ? "+" : ""}${winnerPayoff} (${cursePhrase})`);
+  };
+
+  const auctResetGame = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("Type 'reset' to confirm (will clear all Auction data):");
+    if (pw !== "reset") return;
+    await db.ref("games/auction").remove();
+    setAuctPhase("lobby"); setAuctRound(0); setAuctSubmitted(false);
+    setAuctMyBid(null); setAuctMyResult(null); setAuctAllStats([]);
+    setAuctInputValue(""); setAuctMySignal(null); setAuctRoundStats(null);
+    const newId = generateId();
+    auctId.current = newId;
+    try { localStorage.setItem("gt_auct_id", newId); } catch {}
+    alert("✅ 拍卖游戏已重置 / Auction reset!");
+  };
+
+
+  // ================================================================
   // GRADE GAME — Human matching (unchanged)
   // ================================================================
   const submitHuman = async (myChoice) => {
@@ -1677,10 +1946,22 @@ function App() {
           <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Lemons Market · Asymmetric Info</span>
         </button>
 
+        {/* 7th game — Common-Value Auction (Winner's Curse, Week 12) */}
+        <button className="btn-press" onClick={() => {
+          if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
+          joinAuction();
+        }}
+          style={{ width: "100%", padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #2A1A08, #1A0F05)", border: `1px solid ${C.RED}50`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.RED}25`, marginBottom: 12 }}
+          disabled={!firebaseReady}>
+          <span style={{ fontSize: 18, marginRight: 8 }}>🎴</span>
+          共同价值拍卖
+          <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Common-Value Auction · Week 12</span>
+        </button>
+
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn-press" onClick={() => {
             const pw = prompt("请输入教师密码:");
-            if (pw === "econ2501") { loadStats(); loadNashAllStats(); loadInvestAllResults(); loadUltAllStats(); loadLemAllStats(); setScreen("teacher"); }
+            if (pw === "econ2501") { loadStats(); loadNashAllStats(); loadInvestAllResults(); loadUltAllStats(); loadLemAllStats(); loadAuctAllStats(); setScreen("teacher"); }
             else if (pw !== null) alert("密码错误");
           }}
             style={{ flex: 1, padding: 11, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}35`, borderRadius: 10, color: C.TEXT2, cursor: "pointer" }}>
@@ -3010,6 +3291,282 @@ function App() {
   }
 
   // ================================================================
+  // AUCTION — Player screens
+  // ================================================================
+  if (screen === "auct_intro") {
+    const isPlaying = auctPhase === "playing" && auctRound > 0;
+    const isResults = auctPhase === "results" && auctRound > 0;
+
+    if (isPlaying && !auctSubmitted) return renderAuctPlay();
+    if (isPlaying && auctSubmitted) return renderAuctWait();
+    if (isResults && auctMyResult) return renderAuctResult();
+    if (isResults && !auctMyResult) return renderAuctWait();
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A0F05)` }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>🎴</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>共同价值拍卖</h2>
+          <p style={{ fontSize: 13, color: C.RED, marginBottom: 20 }}>Common-Value Auction · Week 12</p>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", border: `1px solid ${C.RED}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 10 }}>📋 规则 Rules</div>
+            <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7 }}>
+              <p style={{ marginBottom: 6 }}>• 袋子里有 <strong>10 张卡牌</strong>，每张是 {"{"}1, 2, …, 10{"}"} 中的随机整数 (可重复)。</p>
+              <p style={{ marginBottom: 6 }}>• 袋子的真实价值 <strong style={{ color: C.GOLD }}>V</strong> = 10 张卡的<strong>总和</strong> (取值范围 10–100, 期望 55)。</p>
+              <p style={{ marginBottom: 6 }}>• 每位玩家私下随机看到其中的 <strong>2 张卡</strong> — 这是你的私人信号。</p>
+              <p style={{ marginBottom: 6 }}>• 这是 <strong style={{ color: C.GOLD }}>第一价格密封拍卖</strong>: 同时出价，<strong>最高出价者赢得袋子</strong>，按自己的出价付款。</p>
+              <p>• <strong>赢家收益</strong> = V − 出价。其他人 = 0。</p>
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.RED}08`, border: `1px solid ${C.RED}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 4 }}>🩸 想一想 Think</div>
+            <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+              基于你看到的 2 张卡，你怎么估计 V? 而如果你<em>赢了</em>这场拍卖，意味着什么? 这条信息会改变你的估计吗?
+            </div>
+          </Box>
+
+          <div style={{ background: `${C.RED}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.RED}20` }}>
+            <div style={{ width: 40, height: 40, margin: "0 auto 8px", border: `3px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 13, color: C.TEXT2 }}>等待老师开始... Waiting for teacher to start...</div>
+            <div style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>已加入 Joined: {auctPlayerCount}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- AUCTION PLAY ----
+  function renderAuctPlay() {
+    const v = parseInt(auctInputValue);
+    const valid = !isNaN(v) && v >= 0 && v <= 100;
+    const sig = auctMySignal;
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A0F05)` }}>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.RED, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {auctRound} · 🎴 First-Price Sealed-Bid
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>你的出价? Your bid?</h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 16 }}>整数 0–100 / Integer 0–100</p>
+
+          {/* Private signal */}
+          {sig && (
+            <Box style={{ marginBottom: 14, padding: 14, background: `${C.RED}10`, border: `1px solid ${C.RED}50`, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 8 }}>Your 2 cards (private)</div>
+              <div style={{ display: "flex", gap: 14, justifyContent: "center", marginTop: 4 }}>
+                {sig.map((c, i) => (
+                  <div key={i} style={{ width: 72, height: 96, background: `linear-gradient(145deg, ${C.SURFACE}, ${C.BG})`, border: `2px solid ${C.RED}60`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 38, fontWeight: 900, color: C.GOLD, boxShadow: `0 4px 16px ${C.RED}30` }}>
+                    {c}
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 10, color: C.DIM, marginTop: 10, fontStyle: "italic" }}>
+                袋子总共有 10 张卡。你只看到其中 2 张。
+              </div>
+            </Box>
+          )}
+          {!sig && (
+            <Box style={{ marginBottom: 14, padding: 14, background: `${C.SURFACE}`, border: `1px solid ${C.DIM}30` }}>
+              <div style={{ fontSize: 12, color: C.DIM }}>正在抽卡... Drawing cards...</div>
+            </Box>
+          )}
+
+          <Box style={{ marginBottom: 14, padding: 14 }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>你的出价 / Your bid</div>
+            <input type="number" min="0" max="100" step="1" value={auctInputValue}
+              onChange={e => setAuctInputValue(e.target.value.replace(/[^0-9]/g, "").slice(0, 3))}
+              placeholder="0 – 100"
+              style={{ width: "100%", padding: "14px 16px", fontSize: 32, fontWeight: 800, textAlign: "center", background: C.BG, border: `2px solid ${C.RED}40`, borderRadius: 12, color: C.RED, outline: "none" }}
+              onFocus={e => e.target.style.borderColor = C.RED}
+              onBlur={e => e.target.style.borderColor = `${C.RED}40`} />
+
+            <input type="range" min="0" max="100" step="1" value={valid ? v : 50}
+              onChange={e => setAuctInputValue(e.target.value)}
+              style={{ width: "100%", marginTop: 12, accentColor: C.RED }} />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.DIM, marginTop: -4 }}>
+              <span>0</span><span>25</span><span>50</span><span>75</span><span>100</span>
+            </div>
+          </Box>
+
+          {/* Strategy preview */}
+          {valid && (
+            <Box style={{ marginBottom: 14, padding: 10, background: `${C.RED}08`, border: `1px solid ${C.RED}20`, textAlign: "left", fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+              你出 <strong style={{ color: C.RED }}>{v}</strong>。若赢，收益 = <strong style={{ color: C.GREEN }}>V − {v}</strong>。若输，收益 = 0。
+            </Box>
+          )}
+
+          <button className="btn-press" onClick={() => submitAuctBid(auctInputValue)} disabled={!valid || !sig}
+            style={{ width: "100%", padding: 16, fontSize: 16, fontWeight: 800, background: (valid && sig) ? `linear-gradient(135deg, ${C.RED}, #8A2010)` : C.SURFACE, border: "none", borderRadius: 12, color: (valid && sig) ? "white" : C.DIM, cursor: (valid && sig) ? "pointer" : "not-allowed", boxShadow: (valid && sig) ? `0 6px 24px ${C.RED}40` : "none" }}>
+            ✓ 提交出价 / Submit Bid
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- AUCTION WAIT ----
+  function renderAuctWait() {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A0F05)` }}>
+        <div style={{ textAlign: "center", maxWidth: 360 }}>
+          <div style={{ width: 50, height: 50, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+          <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>已提交！等待开标...</h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 14 }}>Round {auctRound} · Waiting for round to close</p>
+          {auctMyBid != null && (
+            <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.RED}30`, marginBottom: 12 }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>Your bid</div>
+              <div style={{ fontSize: 36, fontWeight: 800, color: C.RED }}>{auctMyBid}</div>
+              {auctMySignal && (
+                <div style={{ fontSize: 11, color: C.DIM, marginTop: 6 }}>
+                  Your signal: <strong style={{ color: C.GOLD }}>{auctMySignal.join(" · ")}</strong>
+                </div>
+              )}
+            </div>
+          )}
+          <Box style={{ textAlign: "center", padding: 10 }}>
+            <div style={{ fontSize: 10, color: C.DIM }}>已提交 / Submitted</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: C.RED }}>{auctSubCount} / {auctPlayerCount}</div>
+          </Box>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- AUCTION RESULT ----
+  function renderAuctResult() {
+    const r = auctMyResult;
+    if (!r) return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: `linear-gradient(165deg, ${C.BG}, #1A0F05)` }}>
+        <div style={{ width: 40, height: 40, border: `3px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      </div>
+    );
+
+    const won = r.isWinner;
+    const payoff = r.payoff;
+    const bgTint = won ? (payoff >= 0 ? "#0B200F" : "#200B0B") : "#0F0F1A";
+    const stats = auctRoundStats;
+
+    return (
+      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, ${bgTint})`, overflowY: "auto" }}>
+        <div style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
+          <div className="fade-up" style={{ fontSize: 48, marginBottom: 8 }}>
+            {won ? (payoff > 0 ? "🏆" : payoff === 0 ? "🤝" : "🩸") : "👀"}
+          </div>
+          <h2 className="fade-up fade-up-1" style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>
+            {won ? (payoff > 0 ? "你赢了 (赚钱)!" : payoff === 0 ? "你赢了 (持平)" : "你赢了, 但…") : "你没赢 No win"}
+          </h2>
+          <p className="fade-up fade-up-1" style={{ fontSize: 13, color: won ? (payoff >= 0 ? C.GREEN : C.RED) : C.TEXT2, marginBottom: 20 }}>
+            Round {auctRound} · True V = <strong style={{ color: C.GOLD }}>{r.V}</strong>
+          </p>
+
+          {/* Bag reveal */}
+          <Box className="fade-up fade-up-2" style={{ marginBottom: 14, padding: 14, textAlign: "left", border: `1px solid ${C.GOLD}30` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>🎴 袋子揭晓 The Bag</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center", marginBottom: 8 }}>
+              {Array.isArray(r.bag) && r.bag.map((c, i) => (
+                <div key={i} style={{ width: 32, height: 44, background: C.SURFACE, border: `1px solid ${C.GOLD}40`, borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800, color: C.GOLD }}>
+                  {c}
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: C.TEXT2, textAlign: "center", paddingTop: 8, borderTop: `1px solid ${C.DIM}20`, fontFamily: "monospace" }}>
+              V = {Array.isArray(r.bag) ? r.bag.join(" + ") : "—"} = <strong style={{ color: C.GOLD }}>{r.V}</strong>
+            </div>
+          </Box>
+
+          {/* My bid breakdown */}
+          <Box className="fade-up fade-up-2" style={{ marginBottom: 14, padding: 14, textAlign: "left", border: `1px solid ${C.RED}30` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 10 }}>🎯 你的结果 Your Result</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 12, marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM }}>你的信号 Your signal</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: C.GOLD }}>
+                  {r.mySignal ? r.mySignal.join(" · ") : "—"}
+                </div>
+                {r.myNaiveEst != null && (
+                  <div style={{ fontSize: 10, color: C.DIM, marginTop: 2 }}>
+                    Naive est: 5 × {r.mySignalSum} = <strong style={{ color: C.TEXT }}>{r.myNaiveEst}</strong>
+                  </div>
+                )}
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM }}>你的出价 Your bid</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: C.RED }}>{r.myBid}</div>
+                <div style={{ fontSize: 10, color: C.DIM, marginTop: 2 }}>
+                  vs V = {r.V}: bid {r.myBid > r.V ? "over" : r.myBid < r.V ? "under" : "="} by <strong style={{ color: r.myBid > r.V ? C.RED : C.GREEN }}>{Math.abs(r.myBid - r.V)}</strong>
+                </div>
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: C.TEXT2, fontFamily: "monospace", paddingTop: 8, borderTop: `1px solid ${C.DIM}20` }}>
+              {won
+                ? `你赢了 → 收益 = V − bid = ${r.V} − ${r.myBid} = ${payoff > 0 ? "+" : ""}${payoff}`
+                : `winner: ${r.winnerName} @ ${r.winnerBid} → 你的收益 = 0`}
+            </div>
+          </Box>
+
+          {/* Payoff */}
+          <div className="fade-up fade-up-2" style={{ marginBottom: 16 }}>
+            <Box style={{ textAlign: "center", padding: 16 }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>你的收益 Your payoff</div>
+              <div style={{ fontSize: 44, fontWeight: 800, color: payoff > 0 ? C.GREEN : (payoff < 0 ? C.RED : C.DIM) }}>
+                {payoff > 0 ? "+" : ""}{payoff}
+              </div>
+            </Box>
+          </div>
+
+          {/* Class-wide stats */}
+          {stats && (
+            <Box className="fade-up fade-up-3" style={{ marginBottom: 14, padding: 14, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 10 }}>📊 班级结果 Class Outcomes</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 11 }}>
+                <div style={{ background: `${C.RED}10`, padding: 8, borderRadius: 8, border: `1px solid ${C.RED}25` }}>
+                  <div style={{ color: C.RED, fontWeight: 700, marginBottom: 4 }}>🏆 Winner</div>
+                  <div style={{ color: C.TEXT2 }}>Bid: <strong style={{ color: C.TEXT }}>{stats.winnerBid}</strong></div>
+                  <div style={{ color: C.TEXT2 }}>Payoff: <strong style={{ color: stats.winnerPayoff >= 0 ? C.GREEN : C.RED }}>
+                    {stats.winnerPayoff > 0 ? "+" : ""}{stats.winnerPayoff}
+                  </strong></div>
+                </div>
+                <div style={{ background: `${C.TEAL}10`, padding: 8, borderRadius: 8, border: `1px solid ${C.TEAL}25` }}>
+                  <div style={{ color: C.TEAL, fontWeight: 700, marginBottom: 4 }}>📈 Bids (n={stats.nBidders})</div>
+                  <div style={{ color: C.TEXT2 }}>Avg: <strong style={{ color: C.TEXT }}>{stats.avgBid}</strong></div>
+                  <div style={{ color: C.TEXT2 }}>Range: <strong style={{ color: C.TEXT }}>{stats.minBid}–{stats.maxBid}</strong></div>
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: C.TEXT2, marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.DIM}20` }}>
+                Avg naive estimate (class): <strong style={{ color: C.GOLD }}>{stats.avgNaiveEst}</strong>
+                {" · "}True V: <strong style={{ color: C.GOLD }}>{stats.V}</strong>
+              </div>
+            </Box>
+          )}
+
+          {/* Winner's curse punchline */}
+          {stats && (
+            <Box className="fade-up fade-up-3" style={{ marginBottom: 16, padding: 14, background: `${C.RED}08`, border: `1px solid ${C.RED}25`, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 6 }}>🩸 赢家的诅咒 Winner's Curse</div>
+              <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.7 }}>
+                {stats.overpaid ? (
+                  <>赢家出价 <strong style={{ color: C.RED }}>{stats.winnerBid}</strong> 高于真实价值 <strong style={{ color: C.GOLD }}>{stats.V}</strong> → 赢家<strong style={{ color: C.RED }}>亏损 {-stats.winnerPayoff}</strong>。赢得意味着你拿到了最高的信号 — 而最高信号往往<em>高估</em>V。理性的赢家应该把出价压低！</>
+                ) : (
+                  <>这一轮赢家没有 overpay (出价 {stats.winnerBid} ≤ V = {stats.V})。但请看班级平均朴素估计 vs V: 多轮重复后，winner systematically overpays.</>
+                )}
+              </div>
+            </Box>
+          )}
+
+          <div style={{ background: `${C.RED}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.RED}20` }}>
+            <div style={{ width: 30, height: 30, margin: "0 auto 8px", border: `2px solid ${C.DIM}30`, borderTopColor: C.RED, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 12, color: C.TEXT2 }}>等待下一轮... Waiting for next round...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ================================================================
   // TEACHER PANEL
   // ================================================================
   if (screen === "teacher") {
@@ -3025,8 +3582,8 @@ function App() {
 
           {/* Tab switcher */}
           <div style={{ display: "flex", gap: 4, marginBottom: 20, flexWrap: "wrap" }}>
-            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }, { id: "lemons", label: "🍋 柠檬" }].map(t => (
-              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); if (t.id === "lemons") loadLemAllStats(); }}
+            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }, { id: "lemons", label: "🍋 柠檬" }, { id: "auction", label: "🎴 拍卖" }].map(t => (
+              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); if (t.id === "lemons") loadLemAllStats(); if (t.id === "auction") loadAuctAllStats(); }}
                 style={{ flex: "1 1 70px", padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
                 {t.label}
               </button>
@@ -3643,6 +4200,192 @@ function App() {
                 )}
 
                 <button className="btn-press" onClick={loadLemAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 12 }}>
+                  🔄 刷新数据 Refresh
+                </button>
+              </div>
+            );
+          })()}
+
+          {teacherTab === "auction" && (() => {
+            const latest = auctAllStats.length > 0 ? auctAllStats[auctAllStats.length - 1] : null;
+            // Histogram of bids (0–100, 10 bins of 10)
+            const NBINS = 10;
+            const BINW = 10;
+            const makeBidHist = (raw) => {
+              const values = raw == null ? [] : (Array.isArray(raw) ? raw : Object.values(raw));
+              const counts = Array(NBINS).fill(0);
+              values.forEach(v => {
+                if (typeof v !== "number") return;
+                const idx = Math.min(Math.floor(v / BINW), NBINS - 1);
+                counts[idx]++;
+              });
+              return counts;
+            };
+            const bidHist = latest ? makeBidHist(latest.bids) : null;
+            const maxBin = Math.max(...(bidHist || [1]), 1);
+            // Cumulative winner's-curse line: across rounds, plot winner payoff
+            const curseSeries = auctAllStats.map(s => s.winnerPayoff);
+            const avgCurse = curseSeries.length ? curseSeries.reduce((a, b) => a + b, 0) / curseSeries.length : null;
+
+            return (
+              <div>
+                {/* Status */}
+                <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>轮次 Round</div>
+                    <div style={{ fontSize: 32, fontWeight: 800, color: C.RED }}>{auctRound || "—"}</div>
+                  </Box>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>阶段 Phase</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: auctPhase === "playing" ? C.GREEN : auctPhase === "results" ? C.GOLD : C.DIM, marginTop: 6 }}>
+                      {auctPhase === "playing" ? "进行中" : auctPhase === "results" ? "已揭晓" : "等待中"}
+                    </div>
+                  </Box>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>玩家 Players</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: C.RED, marginTop: 4 }}>{auctPlayerCount}</div>
+                    {auctPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>已交: {auctSubCount}</div>}
+                  </Box>
+                </div>
+
+                {/* Controls */}
+                <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                  {(auctPhase === "lobby" || auctPhase === "results") && (
+                    <button className="btn-press" onClick={() => auctStartRound((auctRound || 0) + 1)}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A08, #1A0F05)`, border: `1px solid ${C.RED}50`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                      ▶️ {auctRound ? `开始第 ${auctRound + 1} 轮` : "开始第 1 轮"}
+                    </button>
+                  )}
+                  {auctPhase === "playing" && (
+                    <button className="btn-press" onClick={auctEndRound}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A0F, #1A1008)`, border: `1px solid ${C.AMBER}50`, borderRadius: 12, color: C.AMBER, cursor: "pointer" }}>
+                      ⏹️ 结束 & 开标
+                    </button>
+                  )}
+                  <button className="btn-press" onClick={auctResetGame}
+                    style={{ padding: 14, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                    🗑️
+                  </button>
+                </div>
+
+                {/* Latest round: bag, V, bid histogram */}
+                {latest && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.RED}20` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 8 }}>
+                      🎴 第 {latest.round} 轮 / Round {latest.round} · True V = <span style={{ color: C.GOLD }}>{latest.V}</span>
+                    </div>
+
+                    {/* Bag reveal */}
+                    {Array.isArray(latest.bag) && (
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, justifyContent: "center", marginBottom: 10 }}>
+                        {latest.bag.map((c, i) => (
+                          <div key={i} style={{ width: 26, height: 36, background: C.SURFACE, border: `1px solid ${C.GOLD}40`, borderRadius: 5, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 800, color: C.GOLD }}>
+                            {c}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Bid histogram */}
+                    <div style={{ fontSize: 10, color: C.TEXT2, marginBottom: 4 }}>
+                      <span style={{ color: C.TEAL }}>■ Bids (μ={latest.avgBid})</span>
+                      {" · "}
+                      <span style={{ color: C.GOLD }}>V dashed line</span>
+                      {" · "}
+                      <span style={{ color: C.RED }}>winner bid = {latest.winnerBid}</span>
+                    </div>
+                    <svg viewBox="0 0 360 170" style={{ width: "100%" }}>
+                      {/* X-axis ticks */}
+                      {[0, 25, 50, 75, 100].map(tick => (
+                        <g key={tick}>
+                          <text x={20 + (tick / 100) * 320} y={155} textAnchor="middle" fontSize="9" fill={C.DIM}>{tick}</text>
+                        </g>
+                      ))}
+                      {/* V reference line */}
+                      <line x1={20 + (latest.V / 100) * 320} y1={10} x2={20 + (latest.V / 100) * 320} y2={140} stroke={C.GOLD} strokeWidth="2" strokeDasharray="3,3" opacity="0.85" />
+                      <text x={20 + (latest.V / 100) * 320} y={12} textAnchor="middle" fontSize="8" fill={C.GOLD}>V={latest.V}</text>
+                      {/* Winner bid reference line */}
+                      <line x1={20 + (latest.winnerBid / 100) * 320} y1={10} x2={20 + (latest.winnerBid / 100) * 320} y2={140} stroke={C.RED} strokeWidth="2" opacity="0.7" />
+                      <text x={20 + (latest.winnerBid / 100) * 320} y={148} textAnchor="middle" fontSize="8" fill={C.RED}>win</text>
+                      {/* Bid bars */}
+                      {bidHist && bidHist.map((c, i) => {
+                        const x = 20 + i * (320 / NBINS) + 2;
+                        const w = (320 / NBINS) - 4;
+                        const h = (c / maxBin) * 120;
+                        return c > 0 ? <rect key={`b${i}`} x={x} y={140 - h} width={w} height={h} fill={C.TEAL} opacity="0.85" /> : null;
+                      })}
+                    </svg>
+
+                    {/* Winner box */}
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.DIM}20`, fontSize: 10 }}>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ color: C.RED }}>🏆 Winner</div>
+                        <div style={{ fontSize: 12, fontWeight: 800, color: C.TEXT, marginTop: 2 }}>
+                          {latest.winnerName || "—"}
+                        </div>
+                        {latest.winnerSignal && (
+                          <div style={{ color: C.DIM, fontSize: 9 }}>signal: {latest.winnerSignal.join("·")}</div>
+                        )}
+                      </div>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ color: C.TEXT2 }}>Win bid vs V</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: latest.winnerBid > latest.V ? C.RED : C.GREEN }}>
+                          {latest.winnerBid} {latest.winnerBid > latest.V ? ">" : latest.winnerBid < latest.V ? "<" : "="} {latest.V}
+                        </div>
+                      </div>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ color: C.TEXT2 }}>Winner payoff</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: latest.winnerPayoff >= 0 ? C.GREEN : C.RED }}>
+                          {latest.winnerPayoff > 0 ? "+" : ""}{latest.winnerPayoff}
+                        </div>
+                      </div>
+                    </div>
+                  </Box>
+                )}
+
+                {/* Multi-round summary */}
+                {auctAllStats.length > 0 && (
+                  <Box>
+                    <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>各轮对比 / Round-by-round</div>
+                    <table style={{ width: "100%", fontSize: 10, borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.DIM }}>R</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.GOLD }}>V</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.RED }}>Win bid</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.TEAL }}>μ Bid</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.GOLD }}>μ Naive</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.GREEN }}>Winner π</td>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {auctAllStats.map((s, i) => (
+                          <tr key={i} style={{ borderTop: `1px solid ${C.DIM}15` }}>
+                            <td style={{ padding: 3, color: C.TEXT }}>{s.round}</td>
+                            <td style={{ padding: 3, color: C.GOLD }}>{s.V}</td>
+                            <td style={{ padding: 3, color: s.winnerBid > s.V ? C.RED : C.TEXT2 }}>{s.winnerBid}</td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.avgBid}</td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.avgNaiveEst}</td>
+                            <td style={{ padding: 3, color: s.winnerPayoff >= 0 ? C.GREEN : C.RED, fontWeight: 700 }}>
+                              {s.winnerPayoff > 0 ? "+" : ""}{s.winnerPayoff}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {avgCurse != null && (
+                      <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.DIM}20`, fontSize: 11, color: C.TEXT2, textAlign: "center" }}>
+                        Avg winner payoff across {auctAllStats.length} round{auctAllStats.length === 1 ? "" : "s"}:
+                        {" "}<strong style={{ color: avgCurse >= 0 ? C.GREEN : C.RED, fontSize: 14 }}>
+                          {avgCurse > 0 ? "+" : ""}{Math.round(avgCurse * 10) / 10}
+                        </strong>
+                        {avgCurse < 0 && <span style={{ color: C.RED }}> 🩸 winner's curse</span>}
+                      </div>
+                    )}
+                  </Box>
+                )}
+
+                <button className="btn-press" onClick={loadAuctAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 12 }}>
                   🔄 刷新数据 Refresh
                 </button>
               </div>
