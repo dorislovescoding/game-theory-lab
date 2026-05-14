@@ -1946,7 +1946,7 @@ function App() {
           <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Lemons Market · Asymmetric Info</span>
         </button>
 
-        {/* 7th game — Common-Value Auction (Winner's Curse, Week 12) */}
+        {/* 7th game — Common-Value Auction (Winner's Curse, Week 11) */}
         <button className="btn-press" onClick={() => {
           if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
           joinAuction();
@@ -1955,7 +1955,7 @@ function App() {
           disabled={!firebaseReady}>
           <span style={{ fontSize: 18, marginRight: 8 }}>🎴</span>
           共同价值拍卖
-          <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Common-Value Auction · Week 12</span>
+          <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Common-Value Auction · Week 11</span>
         </button>
 
         <div style={{ display: "flex", gap: 10 }}>
@@ -3308,23 +3308,33 @@ function App() {
         <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
           <div style={{ fontSize: 48, marginBottom: 8 }}>🎴</div>
           <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>共同价值拍卖</h2>
-          <p style={{ fontSize: 13, color: C.RED, marginBottom: 20 }}>Common-Value Auction · Week 12</p>
+          <p style={{ fontSize: 13, color: C.RED, marginBottom: 20 }}>Common-Value Auction · Week 11</p>
 
           <Box style={{ marginBottom: 16, textAlign: "left", border: `1px solid ${C.RED}25` }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 10 }}>📋 规则 Rules</div>
             <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7 }}>
-              <p style={{ marginBottom: 6 }}>• 袋子里有 <strong>10 张卡牌</strong>，每张是 {"{"}1, 2, …, 10{"}"} 中的随机整数 (可重复)。</p>
-              <p style={{ marginBottom: 6 }}>• 袋子的真实价值 <strong style={{ color: C.GOLD }}>V</strong> = 10 张卡的<strong>总和</strong> (取值范围 10–100, 期望 55)。</p>
-              <p style={{ marginBottom: 6 }}>• 每位玩家私下随机看到其中的 <strong>2 张卡</strong> — 这是你的私人信号。</p>
-              <p style={{ marginBottom: 6 }}>• 这是 <strong style={{ color: C.GOLD }}>第一价格密封拍卖</strong>: 同时出价，<strong>最高出价者赢得袋子</strong>，按自己的出价付款。</p>
-              <p>• <strong>赢家收益</strong> = V − 出价。其他人 = 0。</p>
+              <p style={{ marginBottom: 4 }}>• 袋子里有 <strong>10 张卡牌</strong>，每张是 {"{"}1, 2, …, 10{"}"} 中的随机整数 (可重复)。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}>The bag holds <strong>10 cards</strong>, each an integer drawn i.i.d. from {"{"}1, …, 10{"}"} (with replacement).</p>
+
+              <p style={{ marginBottom: 4 }}>• 袋子的真实价值 <strong style={{ color: C.GOLD }}>V</strong> = 10 张卡的<strong>总和</strong> (取值范围 10–100, 期望 55)。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}>The bag's true value <strong style={{ color: C.GOLD }}>V</strong> = sum of all 10 cards (range 10–100, E[V] = 55).</p>
+
+              <p style={{ marginBottom: 4 }}>• 每位玩家私下随机看到其中的 <strong>2 张卡</strong> — 这是你的私人信号。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}>Each player privately sees <strong>2 of the 10 cards</strong> — this is your private signal.</p>
+
+              <p style={{ marginBottom: 4 }}>• 这是 <strong style={{ color: C.GOLD }}>第一价格密封拍卖</strong>: 同时出价，<strong>最高出价者赢得袋子</strong>，按自己的出价付款。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}>This is a <strong style={{ color: C.GOLD }}>first-price sealed-bid auction</strong>: bid simultaneously; <strong>highest bidder wins the bag</strong> and pays their own bid.</p>
+
+              <p style={{ marginBottom: 4 }}>• <strong>赢家收益</strong> = V − 出价。其他人 = 0。</p>
+              <p style={{ fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}><strong>Winner's payoff</strong> = V − bid. Everyone else: 0.</p>
             </div>
           </Box>
 
           <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.RED}08`, border: `1px solid ${C.RED}25` }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.RED, marginBottom: 4 }}>🩸 想一想 Think</div>
             <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
-              基于你看到的 2 张卡，你怎么估计 V? 而如果你<em>赢了</em>这场拍卖，意味着什么? 这条信息会改变你的估计吗?
+              <p style={{ marginBottom: 4 }}>基于你看到的 2 张卡，你怎么估计 V? 而如果你<em>赢了</em>这场拍卖，意味着什么? 这条信息会改变你的估计吗?</p>
+              <p style={{ color: C.DIM }}>Given the 2 cards you observe, how do you estimate V? And if you <em>win</em> the auction — what does that tell you? Should it change your estimate?</p>
             </div>
           </Box>
 
