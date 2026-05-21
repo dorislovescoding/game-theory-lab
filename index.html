@@ -315,6 +315,25 @@ function App() {
   const [auctRoundStats, setAuctRoundStats] = useState(null);
   const [auctAllStats, setAuctAllStats] = useState([]);
 
+  // ---- CASCADE (Information Cascade, Week 12) ----
+  // A pre-set sequence of private signals is shown to students in login order.
+  // Students publicly announce their guess; later students observe history and may rationally herd.
+  const [cascPhase, setCascPhase] = useState("lobby"); // "lobby" | "playing" | "results"
+  const [cascRound, setCascRound] = useState(0);
+  const [cascMySignalIndex, setCascMySignalIndex] = useState(null); // my role number (0-indexed)
+  const [cascMySignal, setCascMySignal] = useState(null); // "silver" | "colored"
+  const [cascSubmitted, setCascSubmitted] = useState(false);
+  const [cascMyGuess, setCascMyGuess] = useState(null);
+  const [cascAnnouncements, setCascAnnouncements] = useState([]); // [{signalIndex, guess, name}]
+  const [cascPlayerCount, setCascPlayerCount] = useState(0);
+  const [cascRoundConfig, setCascRoundConfig] = useState(null); // {trueState, signalSequence, maxPlayers, showHistory}
+  const [cascMyResult, setCascMyResult] = useState(null);
+  // Teacher controls
+  const [cascNextTrueState, setCascNextTrueState] = useState("colored"); // "silver" or "colored"
+  const [cascNextSeedCount, setCascNextSeedCount] = useState(2); // how many leading signals are "seeded" against the true state
+  const [cascNextMaxPlayers, setCascNextMaxPlayers] = useState(8);
+  const [cascNextShowHistory, setCascNextShowHistory] = useState(true); // show prior announcements on students' phones
+
   const game = GAMES[gameId];
   const myId = useRef(generateId());
   const nashId = useRef(() => {
@@ -354,6 +373,16 @@ function App() {
       let id = localStorage.getItem("gt_auct_id");
       if (!id) { id = generateId(); localStorage.setItem("gt_auct_id", id); }
       auctId.current = id;
+    } catch {}
+  }, []);
+
+  const cascId = useRef(generateId());
+  // Initialize persistent cascade ID from localStorage
+  useEffect(() => {
+    try {
+      let id = localStorage.getItem("gt_casc_id");
+      if (!id) { id = generateId(); localStorage.setItem("gt_casc_id", id); }
+      cascId.current = id;
     } catch {}
   }, []);
 
@@ -1630,6 +1659,294 @@ function App() {
 
 
   // ================================================================
+  // CASCADE — Firebase listeners
+  // ================================================================
+  const cascListenersRef = useRef([]);
+
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const stateRef = db.ref("games/cascade/state");
+    const onState = stateRef.on("value", (snap) => {
+      const s = snap.val();
+      if (!s) { setCascPhase("lobby"); setCascRound(0); setCascRoundConfig(null); return; }
+      setCascPhase(s.phase || "lobby");
+      setCascRound(s.round || 0);
+      setCascRoundConfig({
+        trueState: s.trueState,
+        signalSequence: s.signalSequence || [],
+        maxPlayers: s.maxPlayers || 8,
+        showHistory: s.showHistory !== false,
+      });
+    });
+    cascListenersRef.current.push(() => stateRef.off("value", onState));
+
+    const playersRef = db.ref("games/cascade/players");
+    const onPlayers = playersRef.on("value", (snap) => {
+      const p = snap.val() || {};
+      setCascPlayerCount(Object.keys(p).length);
+      // Find my own signalIndex if I'm in the player list
+      const me = p[cascId.current];
+      if (me && typeof me.signalIndex === "number") {
+        setCascMySignalIndex(me.signalIndex);
+      }
+    });
+    cascListenersRef.current.push(() => playersRef.off("value", onPlayers));
+
+    return () => cascListenersRef.current.forEach(off => off());
+  }, [firebaseReady]);
+
+  // Listen to public announcements in current round
+  useEffect(() => {
+    if (!firebaseReady || !cascRound) return;
+    const annRef = db.ref(`games/cascade/rounds/${cascRound}/announcements`);
+    const onAnn = annRef.on("value", (snap) => {
+      const a = snap.val() || {};
+      // Sort by signalIndex
+      const arr = Object.values(a).sort((x, y) => x.signalIndex - y.signalIndex);
+      setCascAnnouncements(arr);
+    });
+    return () => annRef.off("value", onAnn);
+  }, [firebaseReady, cascRound]);
+
+  // Compute my signal from the signal sequence and my role number
+  useEffect(() => {
+    if (!cascRoundConfig || cascMySignalIndex == null) return;
+    const seq = cascRoundConfig.signalSequence;
+    if (seq && cascMySignalIndex < seq.length) {
+      setCascMySignal(seq[cascMySignalIndex]);
+    }
+  }, [cascRoundConfig, cascMySignalIndex]);
+
+  // Watch for my own announcement (in case I already submitted)
+  useEffect(() => {
+    if (!firebaseReady || !cascRound) return;
+    const myAnnRef = db.ref(`games/cascade/rounds/${cascRound}/announcements/${cascId.current}`);
+    myAnnRef.once("value", (snap) => {
+      const a = snap.val();
+      if (a) {
+        setCascSubmitted(true);
+        setCascMyGuess(a.guess);
+      }
+    });
+  }, [firebaseReady, cascRound]);
+
+  // When results phase, load my result
+  useEffect(() => {
+    if (!firebaseReady || cascPhase !== "results" || !cascRound) return;
+    const resRef = db.ref(`games/cascade/rounds/${cascRound}/playerResults/${cascId.current}`);
+    resRef.once("value", (snap) => {
+      const r = snap.val();
+      if (r) setCascMyResult(r);
+    });
+  }, [firebaseReady, cascPhase, cascRound]);
+
+  // Reset per-round transient state when new round starts
+  useEffect(() => {
+    if (cascPhase === "playing") {
+      setCascSubmitted(false);
+      setCascMyGuess(null);
+      setCascMyResult(null);
+    }
+  }, [cascPhase, cascRound]);
+
+  // ================================================================
+  // CASCADE — Player functions
+  // ================================================================
+  const joinCascade = async () => {
+    if (!firebaseReady) return;
+    // Check if already joined
+    const existSnap = await db.ref(`games/cascade/players/${cascId.current}`).once("value");
+    if (existSnap.val()) {
+      setScreen("casc_intro");
+      return;
+    }
+    // Atomically assign next signalIndex via transaction on the players list count
+    const playersRef = db.ref("games/cascade/players");
+    const stateSnap = await db.ref("games/cascade/state").once("value");
+    const state = stateSnap.val();
+    const maxPlayers = (state && state.maxPlayers) || 8;
+
+    // Use transaction to atomically increment the assignment counter
+    const counterRef = db.ref("games/cascade/nextSignalIndex");
+    const result = await counterRef.transaction((current) => {
+      const next = (current || 0);
+      if (next >= maxPlayers) return; // abort: full
+      return next + 1;
+    });
+
+    if (!result.committed || result.snapshot.val() == null) {
+      alert("名额已满 / All signal slots are taken. You'll be an observer.");
+      // Still register as observer with signalIndex = -1
+      await db.ref(`games/cascade/players/${cascId.current}`).set({
+        name: name || "匿名",
+        studentId: studentId || "",
+        signalIndex: -1,
+        timestamp: firebase.database.ServerValue.TIMESTAMP,
+      });
+      setScreen("casc_intro");
+      return;
+    }
+    const myIndex = result.snapshot.val() - 1; // 0-indexed
+    await db.ref(`games/cascade/players/${cascId.current}`).set({
+      name: name || "匿名",
+      studentId: studentId || "",
+      signalIndex: myIndex,
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setCascMySignalIndex(myIndex);
+    setScreen("casc_intro");
+  };
+
+  const submitCascGuess = async (guess) => {
+    if (!firebaseReady || !cascRound || cascSubmitted) return;
+    if (cascMySignalIndex == null || cascMySignalIndex < 0) {
+      alert("你是观察者，没有投票 / You are an observer.");
+      return;
+    }
+    await db.ref(`games/cascade/rounds/${cascRound}/announcements/${cascId.current}`).set({
+      signalIndex: cascMySignalIndex,
+      signal: cascMySignal,
+      guess: guess,
+      name: name || "匿名",
+      studentId: studentId || "",
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setCascMyGuess(guess);
+    setCascSubmitted(true);
+  };
+
+  // ================================================================
+  // CASCADE — Teacher functions
+  // ================================================================
+  // Generate a signal sequence given true state, seed count, seed color, max players.
+  // Seed signals are the first `seedCount` signals, all set to the "misleading" color
+  // (the one opposite to true state). The remaining signals match the true 2/3 vs 1/3
+  // distribution (i.e., majority color appears 2/3 of the time).
+  const cascGenerateSignalSequence = (trueState, seedCount, maxPlayers) => {
+    const majorityColor = trueState; // "silver" or "colored"
+    const minorityColor = trueState === "silver" ? "colored" : "silver";
+    const seq = [];
+    // Seed: misleading signals
+    for (let i = 0; i < seedCount && i < maxPlayers; i++) {
+      seq.push(minorityColor);
+    }
+    // Remainder: 2/3 majority, 1/3 minority. Use deterministic interleaving rather
+    // than random so teacher can preview exactly what will appear.
+    let remaining = maxPlayers - seedCount;
+    let cnt = 0;
+    while (seq.length < maxPlayers) {
+      // every 3rd one is the minority color
+      if (cnt % 3 === 2) seq.push(minorityColor);
+      else seq.push(majorityColor);
+      cnt++;
+    }
+    return seq;
+  };
+
+  const cascStartRound = async (roundNum) => {
+    if (!firebaseReady) return;
+    const playersSnap = await db.ref("games/cascade/players").once("value");
+    const players = playersSnap.val() || {};
+    if (Object.keys(players).length === 0) {
+      alert("没有玩家 / No players have joined yet!");
+      return;
+    }
+    const seq = cascGenerateSignalSequence(
+      cascNextTrueState,
+      cascNextSeedCount,
+      cascNextMaxPlayers
+    );
+    const updates = {};
+    updates[`games/cascade/rounds/${roundNum}/trueState`] = cascNextTrueState;
+    updates[`games/cascade/rounds/${roundNum}/signalSequence`] = seq;
+    updates[`games/cascade/rounds/${roundNum}/maxPlayers`] = cascNextMaxPlayers;
+    updates[`games/cascade/state`] = {
+      round: roundNum,
+      phase: "playing",
+      trueState: cascNextTrueState,
+      signalSequence: seq,
+      maxPlayers: cascNextMaxPlayers,
+      showHistory: cascNextShowHistory,
+    };
+    await db.ref().update(updates);
+  };
+
+  const cascEndRound = async () => {
+    if (!firebaseReady || !cascRound) return;
+    const [annSnap, configSnap, playersSnap] = await Promise.all([
+      db.ref(`games/cascade/rounds/${cascRound}/announcements`).once("value"),
+      db.ref(`games/cascade/rounds/${cascRound}`).once("value"),
+      db.ref("games/cascade/players").once("value"),
+    ]);
+    const announcements = annSnap.val() || {};
+    const config = configSnap.val() || {};
+    const trueState = config.trueState;
+    const signalSequence = config.signalSequence || [];
+
+    const playerResults = {};
+    for (const [pid, ann] of Object.entries(announcements)) {
+      const correct = ann.guess === trueState;
+      playerResults[pid] = {
+        signalIndex: ann.signalIndex,
+        signal: ann.signal,
+        guess: ann.guess,
+        trueState: trueState,
+        correct: correct,
+        signalSequence: signalSequence,
+        allAnnouncements: Object.values(announcements)
+          .sort((a, b) => a.signalIndex - b.signalIndex)
+          .map(a => ({ signalIndex: a.signalIndex, signal: a.signal, guess: a.guess, name: a.name })),
+      };
+    }
+
+    // Aggregate stats: how many drew majority signal but announced opposite (cascade evidence)
+    const anns = Object.values(announcements).sort((a, b) => a.signalIndex - b.signalIndex);
+    const majorityColor = trueState;
+    const minorityColor = trueState === "silver" ? "colored" : "silver";
+    let drewMaj = 0, drewMin = 0;
+    let saidMaj = 0, saidMin = 0;
+    let drewMajSaidMin = 0;
+    let drewMinSaidMaj = 0;
+    anns.forEach(a => {
+      if (a.signal === majorityColor) drewMaj++; else drewMin++;
+      if (a.guess === majorityColor) saidMaj++; else saidMin++;
+      if (a.signal === majorityColor && a.guess === minorityColor) drewMajSaidMin++;
+      if (a.signal === minorityColor && a.guess === majorityColor) drewMinSaidMaj++;
+    });
+
+    const stats = {
+      trueState, signalSequence, announcements: anns,
+      nVoters: anns.length,
+      drewMaj, drewMin, saidMaj, saidMin,
+      drewMajSaidMin, drewMinSaidMaj,
+      cascadeWon: saidMin > saidMaj, // did the wrong color win the announcements?
+    };
+
+    const updates = {};
+    updates[`games/cascade/rounds/${cascRound}/playerResults`] = playerResults;
+    updates[`games/cascade/rounds/${cascRound}/stats`] = stats;
+    updates["games/cascade/state/phase"] = "results";
+    await db.ref().update(updates);
+    const cascadePhrase = stats.cascadeWon ? "⚠️ wrong cascade locked in!" : "✓ majority guessed correctly";
+    alert(`✅ Round ${cascRound}: True state = ${trueState}. ${anns.length} voters, ${saidMaj} said ${majorityColor}, ${saidMin} said ${minorityColor}. ${cascadePhrase}`);
+  };
+
+  const cascResetGame = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("Type 'reset' to confirm (will clear all Cascade data):");
+    if (pw !== "reset") return;
+    await db.ref("games/cascade").remove();
+    setCascPhase("lobby"); setCascRound(0); setCascSubmitted(false);
+    setCascMyGuess(null); setCascMyResult(null); setCascMySignalIndex(null);
+    setCascMySignal(null); setCascAnnouncements([]); setCascRoundConfig(null);
+    const newId = generateId();
+    cascId.current = newId;
+    try { localStorage.setItem("gt_casc_id", newId); } catch {}
+    alert("✅ 信息瀑布游戏已重置 / Cascade reset!");
+  };
+
+
+  // ================================================================
   // GRADE GAME — Human matching (unchanged)
   // ================================================================
   const submitHuman = async (myChoice) => {
@@ -1956,6 +2273,18 @@ function App() {
           <span style={{ fontSize: 18, marginRight: 8 }}>🎴</span>
           共同价值拍卖
           <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Common-Value Auction · Week 11</span>
+        </button>
+
+        {/* 8th game — Information Cascade (Week 12) */}
+        <button className="btn-press" onClick={() => {
+          if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
+          joinCascade();
+        }}
+          style={{ width: "100%", padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #1A2840, #0F1825)", border: `1px solid ${C.AMBER}50`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.AMBER}25`, marginBottom: 12 }}
+          disabled={!firebaseReady}>
+          <span style={{ fontSize: 18, marginRight: 8 }}>🍫</span>
+          信息瀑布
+          <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Information Cascade · Week 12</span>
         </button>
 
         <div style={{ display: "flex", gap: 10 }}>
@@ -3577,6 +3906,286 @@ function App() {
   }
 
   // ================================================================
+  // CASCADE — Player screens
+  // ================================================================
+  if (screen === "casc_intro") {
+    const isPlaying = cascPhase === "playing" && cascRound > 0;
+    const isResults = cascPhase === "results" && cascRound > 0;
+    const isObserver = cascMySignalIndex === -1;
+    const isCalledAlready = cascMySignalIndex != null && cascMySignalIndex >= 0 && cascAnnouncements.some(a => a.signalIndex === cascMySignalIndex);
+
+    // The "my turn" condition: I have a signal index, the previous student has announced
+    // (or I am student #0), and I haven't announced yet.
+    const lastAnnouncedIndex = cascAnnouncements.length > 0
+      ? Math.max(...cascAnnouncements.map(a => a.signalIndex))
+      : -1;
+    const myTurn = isPlaying && !isObserver && cascMySignalIndex != null
+      && !cascSubmitted && cascMySignalIndex <= lastAnnouncedIndex + 1;
+    const waitingForEarlierStudent = isPlaying && !isObserver && cascMySignalIndex != null
+      && !cascSubmitted && cascMySignalIndex > lastAnnouncedIndex + 1;
+
+    if (isPlaying && myTurn) return renderCascPlay();
+    if (isPlaying && (cascSubmitted || waitingForEarlierStudent)) return renderCascWait();
+    if (isResults && cascMyResult) return renderCascResult();
+    if (isResults && !cascMyResult) return renderCascWait();
+
+    // Lobby (waiting for teacher to start)
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1F2A)` }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>🍫</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>信息瀑布</h2>
+          <p style={{ fontSize: 13, color: C.AMBER, marginBottom: 20 }}>Information Cascade · Week 12</p>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", border: `1px solid ${C.AMBER}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 10 }}>📋 规则 Rules</div>
+            <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7 }}>
+              <p style={{ marginBottom: 4 }}>• 老师准备了一个袋子里装 3 颗巧克力。两种可能：</p>
+              <p style={{ marginBottom: 4, paddingLeft: 12 }}>— <strong>多数银色</strong>: 2 银 + 1 彩色</p>
+              <p style={{ marginBottom: 8, paddingLeft: 12 }}>— <strong>多数彩色</strong>: 2 彩色 + 1 银</p>
+              <p style={{ marginBottom: 4, fontSize: 11, color: C.TEXT2 }}>The teacher has a bag with 3 chocolates: either majority-silver (2 silver + 1 colored) or majority-colored (2 colored + 1 silver).</p>
+
+              <p style={{ marginBottom: 4, marginTop: 8 }}>• 你登录时按顺序分到一个编号。轮到你时，你会看到<strong>一个私人信号</strong> (你随机抽到的一颗巧克力)。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2 }}>Upon login you get a number. When called, you see your <strong>private signal</strong> (one chocolate's color).</p>
+
+              <p style={{ marginBottom: 4 }}>• 公开宣布你的猜测：<strong>多数银色</strong> 还是 <strong>多数彩色</strong>。后面的同学会看到你的宣布 (但不会看到你抽到什么)。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2 }}>Publicly announce your guess. Later students see your announcement (not your signal).</p>
+
+              <p style={{ marginBottom: 4 }}>• 猜对得奖励。</p>
+              <p style={{ fontSize: 11, color: C.TEXT2 }}>Correct guesses get rewarded.</p>
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.AMBER}08`, border: `1px solid ${C.AMBER}25` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 4 }}>🤔 想一想 Think</div>
+            <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+              <p style={{ marginBottom: 4 }}>如果前面几位同学都猜"多数银色"，而你抽到彩色，你应该宣布什么? 你的私人信号 vs 大家的公开信息，哪个更可信?</p>
+              <p style={{ color: C.DIM }}>If earlier students all said "majority-silver" but you drew colored, what should you announce? Trust your private signal or the public history?</p>
+            </div>
+          </Box>
+
+          {cascMySignalIndex != null && cascMySignalIndex >= 0 && (
+            <Box style={{ marginBottom: 14, padding: 14, textAlign: "center", border: `1px solid ${C.AMBER}40`, background: `${C.AMBER}10` }}>
+              <div style={{ fontSize: 11, color: C.DIM, letterSpacing: "0.1em", textTransform: "uppercase" }}>You are</div>
+              <div style={{ fontSize: 36, fontWeight: 900, color: C.AMBER, margin: "4px 0" }}>#{cascMySignalIndex + 1}</div>
+              <div style={{ fontSize: 11, color: C.TEXT2 }}>请等待老师叫到你 / Wait for the teacher to call your number</div>
+            </Box>
+          )}
+          {isObserver && (
+            <Box style={{ marginBottom: 14, padding: 14, textAlign: "center", border: `1px solid ${C.DIM}40` }}>
+              <div style={{ fontSize: 13, color: C.TEXT2 }}>👀 观察者 Observer</div>
+              <div style={{ fontSize: 11, color: C.DIM, marginTop: 4 }}>名额已满，请观看其他同学的瀑布形成 / Slots full — watch the cascade unfold</div>
+            </Box>
+          )}
+
+          <div style={{ background: `${C.AMBER}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.AMBER}20` }}>
+            <div style={{ width: 40, height: 40, margin: "0 auto 8px", border: `3px solid ${C.DIM}30`, borderTopColor: C.AMBER, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 13, color: C.TEXT2 }}>等待老师开始... Waiting for teacher to start...</div>
+            <div style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>已加入 Joined: {cascPlayerCount}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- CASCADE PLAY ----
+  function renderCascPlay() {
+    const sig = cascMySignal;
+    const showHistory = cascRoundConfig && cascRoundConfig.showHistory;
+    const sigColor = sig === "silver" ? "#C0C0C0" : "#E74C3C";
+    const sigLabel = sig === "silver" ? "银色 SILVER" : "彩色 COLORED";
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1F2A)` }}>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.AMBER, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {cascRound} · 🍫 Your Turn
+          </div>
+          <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>You are #{cascMySignalIndex + 1}</div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 12 }}>你的猜测? Your guess?</h2>
+
+          {/* Private signal display */}
+          {sig && (
+            <Box style={{ marginBottom: 14, padding: 18, background: `${C.AMBER}10`, border: `1px solid ${C.AMBER}50`, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>Your private signal</div>
+              <div style={{ width: 110, height: 110, margin: "0 auto", borderRadius: "50%", background: sigColor, boxShadow: `0 6px 24px ${sigColor}66`, display: "flex", alignItems: "center", justifyContent: "center", border: `4px solid ${C.SURFACE}` }}>
+                <div style={{ fontSize: 38 }}>🍫</div>
+              </div>
+              <div style={{ fontSize: 14, fontWeight: 800, color: sigColor, marginTop: 10, letterSpacing: "0.05em" }}>{sigLabel}</div>
+              <div style={{ fontSize: 10, color: C.DIM, marginTop: 6, fontStyle: "italic" }}>
+                只有你看得到 / Only you can see this
+              </div>
+            </Box>
+          )}
+
+          {/* Public history */}
+          {showHistory && cascAnnouncements.length > 0 && (
+            <Box style={{ marginBottom: 14, padding: 12, textAlign: "left", border: `1px solid ${C.DIM}30` }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.TEXT2, marginBottom: 8 }}>📢 Public history</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {cascAnnouncements.map((a, i) => (
+                  <div key={i} style={{ fontSize: 10, padding: "4px 8px", background: C.SURFACE, borderRadius: 6, color: a.guess === "silver" ? "#C0C0C0" : "#E74C3C", border: `1px solid ${a.guess === "silver" ? "#C0C0C0" : "#E74C3C"}40` }}>
+                    #{a.signalIndex + 1}: {a.guess === "silver" ? "银 S" : "彩 C"}
+                  </div>
+                ))}
+              </div>
+            </Box>
+          )}
+
+          {/* Two announcement buttons */}
+          <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+            <button className="btn-press" onClick={() => submitCascGuess("silver")}
+              style={{ flex: 1, padding: "20px 8px", fontSize: 16, fontWeight: 800, background: "linear-gradient(135deg, #2A2A2A, #1A1A1A)", border: `2px solid #C0C0C0`, borderRadius: 12, color: "#C0C0C0", cursor: "pointer", boxShadow: "0 4px 16px #C0C0C033" }}>
+              <div style={{ fontSize: 24, marginBottom: 4 }}>⚪</div>
+              多数银色
+              <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2, fontWeight: 400 }}>Majority Silver</div>
+            </button>
+            <button className="btn-press" onClick={() => submitCascGuess("colored")}
+              style={{ flex: 1, padding: "20px 8px", fontSize: 16, fontWeight: 800, background: "linear-gradient(135deg, #401818, #2A1010)", border: `2px solid #E74C3C`, borderRadius: 12, color: "#E74C3C", cursor: "pointer", boxShadow: "0 4px 16px #E74C3C33" }}>
+              <div style={{ fontSize: 24, marginBottom: 4 }}>🔴</div>
+              多数彩色
+              <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2, fontWeight: 400 }}>Majority Colored</div>
+            </button>
+          </div>
+          <div style={{ fontSize: 10, color: C.DIM, marginTop: 8 }}>
+            按下按钮后，宣布会公开 / Your announcement becomes public immediately
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- CASCADE WAIT ----
+  function renderCascWait() {
+    const showHistory = cascRoundConfig && cascRoundConfig.showHistory;
+    const isObserver = cascMySignalIndex === -1;
+    const lastIdx = cascAnnouncements.length > 0 ? Math.max(...cascAnnouncements.map(a => a.signalIndex)) : -1;
+    const waitingForMe = cascMySignalIndex != null && cascMySignalIndex > lastIdx + 1 && !cascSubmitted;
+    const peopleBefore = cascMySignalIndex != null && cascMySignalIndex >= 0 ? cascMySignalIndex - cascAnnouncements.length : null;
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1F2A)` }}>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          {cascSubmitted ? (
+            <>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+              <h2 style={{ fontSize: 20, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>已宣布 Announced</h2>
+              <p style={{ fontSize: 14, color: C.AMBER, marginBottom: 16 }}>
+                You guessed: <strong>{cascMyGuess === "silver" ? "多数银色 / Majority Silver" : "多数彩色 / Majority Colored"}</strong>
+              </p>
+            </>
+          ) : isObserver ? (
+            <>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>👀</div>
+              <h2 style={{ fontSize: 20, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>观察中 Observing</h2>
+              <p style={{ fontSize: 12, color: C.DIM, marginBottom: 16 }}>名额已满 / All signal slots are taken</p>
+            </>
+          ) : waitingForMe ? (
+            <>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>⏳</div>
+              <h2 style={{ fontSize: 20, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>等待轮到你</h2>
+              <p style={{ fontSize: 12, color: C.TEXT2, marginBottom: 4 }}>You are #{cascMySignalIndex + 1}</p>
+              <p style={{ fontSize: 11, color: C.DIM, marginBottom: 16 }}>{peopleBefore} student{peopleBefore === 1 ? "" : "s"} ahead of you</p>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>⏳</div>
+              <h2 style={{ fontSize: 20, fontWeight: 800, color: C.TEXT, marginBottom: 16 }}>等待... Waiting...</h2>
+            </>
+          )}
+
+          {/* Public history (live) */}
+          {showHistory && cascAnnouncements.length > 0 && (
+            <Box style={{ marginBottom: 14, padding: 12, textAlign: "left", border: `1px solid ${C.DIM}30` }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.TEXT2, marginBottom: 8 }}>📢 Public history</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {cascAnnouncements.map((a, i) => (
+                  <div key={i} style={{ fontSize: 10, padding: "4px 8px", background: C.SURFACE, borderRadius: 6, color: a.guess === "silver" ? "#C0C0C0" : "#E74C3C", border: `1px solid ${a.guess === "silver" ? "#C0C0C0" : "#E74C3C"}40` }}>
+                    #{a.signalIndex + 1}: {a.guess === "silver" ? "银 S" : "彩 C"}
+                  </div>
+                ))}
+              </div>
+            </Box>
+          )}
+
+          <div style={{ background: `${C.AMBER}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.AMBER}20` }}>
+            <div style={{ width: 30, height: 30, margin: "0 auto 8px", border: `2px solid ${C.DIM}30`, borderTopColor: C.AMBER, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 12, color: C.TEXT2 }}>等待... Waiting...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- CASCADE RESULT ----
+  function renderCascResult() {
+    const r = cascMyResult;
+    if (!r) return null;
+    const correct = r.correct;
+    const sigColor = r.signal === "silver" ? "#C0C0C0" : "#E74C3C";
+    const trueColor = r.trueState === "silver" ? "#C0C0C0" : "#E74C3C";
+
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #1A1F2A)`, overflowY: "auto" }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Home</button>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center", paddingTop: 20 }}>
+          <div style={{ fontSize: 11, color: C.AMBER, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>Round {cascRound} · Results</div>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>{correct ? "✅" : "❌"}</div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: correct ? C.GREEN : C.RED, marginBottom: 14 }}>
+            {correct ? "正确 Correct!" : "错误 Wrong"}
+          </h2>
+
+          <Box style={{ marginBottom: 12, textAlign: "left" }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 4 }}>True state</div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: trueColor }}>多数{r.trueState === "silver" ? "银色" : "彩色"} / Majority {r.trueState}</div>
+          </Box>
+
+          <Box style={{ marginBottom: 12, textAlign: "left" }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 4 }}>Your private signal (#{r.signalIndex + 1})</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: sigColor }}>{r.signal === "silver" ? "⚪ 银色" : "🔴 彩色"}</div>
+          </Box>
+
+          <Box style={{ marginBottom: 12, textAlign: "left" }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 4 }}>Your guess</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: r.guess === "silver" ? "#C0C0C0" : "#E74C3C" }}>{r.guess === "silver" ? "多数银色 / Majority Silver" : "多数彩色 / Majority Colored"}</div>
+          </Box>
+
+          {Array.isArray(r.allAnnouncements) && (
+            <Box style={{ marginBottom: 14, textAlign: "left" }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.AMBER, marginBottom: 8 }}>All signals vs announcements</div>
+              <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ color: C.DIM, borderBottom: `1px solid ${C.DIM}30` }}>
+                    <th style={{ textAlign: "left", padding: 4 }}>#</th>
+                    <th style={{ textAlign: "center", padding: 4 }}>Drew</th>
+                    <th style={{ textAlign: "center", padding: 4 }}>Announced</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {r.allAnnouncements.map((a, i) => {
+                    const drewColor = a.signal === "silver" ? "#C0C0C0" : "#E74C3C";
+                    const saidColor = a.guess === "silver" ? "#C0C0C0" : "#E74C3C";
+                    const mismatch = a.signal !== a.guess;
+                    return (
+                      <tr key={i} style={{ borderBottom: `1px solid ${C.DIM}15`, background: mismatch ? `${C.AMBER}10` : "transparent" }}>
+                        <td style={{ padding: 4, color: C.TEXT2 }}>{a.signalIndex + 1}</td>
+                        <td style={{ textAlign: "center", padding: 4, color: drewColor, fontWeight: 600 }}>{a.signal === "silver" ? "银" : "彩"}</td>
+                        <td style={{ textAlign: "center", padding: 4, color: saidColor, fontWeight: 600 }}>{a.guess === "silver" ? "银" : "彩"}{mismatch && " ⚡"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <div style={{ fontSize: 10, color: C.DIM, marginTop: 8, fontStyle: "italic" }}>⚡ = signal and announcement disagreed (rational herding)</div>
+            </Box>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ================================================================
   // TEACHER PANEL
   // ================================================================
   if (screen === "teacher") {
@@ -3592,7 +4201,7 @@ function App() {
 
           {/* Tab switcher */}
           <div style={{ display: "flex", gap: 4, marginBottom: 20, flexWrap: "wrap" }}>
-            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }, { id: "lemons", label: "🍋 柠檬" }, { id: "auction", label: "🎴 拍卖" }].map(t => (
+            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }, { id: "lemons", label: "🍋 柠檬" }, { id: "auction", label: "🎴 拍卖" }, { id: "cascade", label: "🍫 瀑布" }].map(t => (
               <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); if (t.id === "lemons") loadLemAllStats(); if (t.id === "auction") loadAuctAllStats(); }}
                 style={{ flex: "1 1 70px", padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
                 {t.label}
@@ -4398,6 +5007,244 @@ function App() {
                 <button className="btn-press" onClick={loadAuctAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 12 }}>
                   🔄 刷新数据 Refresh
                 </button>
+              </div>
+            );
+          })()}
+
+          {/* ---- CASCADE TAB ---- */}
+          {teacherTab === "cascade" && (() => {
+            // Preview the signal sequence that will be generated for the next round
+            const previewSeq = cascGenerateSignalSequence(
+              cascNextTrueState,
+              cascNextSeedCount,
+              cascNextMaxPlayers
+            );
+            const minorityColor = cascNextTrueState === "silver" ? "colored" : "silver";
+
+            // Current round state
+            const isPlaying = cascPhase === "playing";
+            const isResults = cascPhase === "results";
+            const trueState = cascRoundConfig?.trueState;
+            const sortedAnns = [...cascAnnouncements].sort((a, b) => a.signalIndex - b.signalIndex);
+            const lastAnnouncedIndex = sortedAnns.length > 0 ? Math.max(...sortedAnns.map(a => a.signalIndex)) : -1;
+            const currentSeq = cascRoundConfig?.signalSequence || [];
+            const nextToCall = lastAnnouncedIndex + 1;
+
+            // Stats for the latest round (if available)
+            const showResults = isResults && sortedAnns.length > 0;
+            let saidMaj = 0, saidMin = 0, drewMaj = 0, drewMin = 0, mismatch = 0;
+            if (showResults && trueState) {
+              const majorityColor = trueState;
+              sortedAnns.forEach(a => {
+                if (a.guess === majorityColor) saidMaj++; else saidMin++;
+                if (a.signal === majorityColor) drewMaj++; else drewMin++;
+                if (a.signal !== a.guess) mismatch++;
+              });
+            }
+
+            return (
+              <div>
+                {/* Status row */}
+                <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>轮次 Round</div>
+                    <div style={{ fontSize: 32, fontWeight: 800, color: C.AMBER }}>{cascRound || "—"}</div>
+                  </Box>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>阶段 Phase</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: isPlaying ? C.GREEN : isResults ? C.GOLD : C.DIM, marginTop: 6 }}>
+                      {isPlaying ? "进行中" : isResults ? "已揭晓" : "等待中"}
+                    </div>
+                  </Box>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>玩家 Players</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: C.AMBER, marginTop: 4 }}>{cascPlayerCount}</div>
+                    {isPlaying && <div style={{ fontSize: 10, color: C.GREEN }}>已宣布: {sortedAnns.length}</div>}
+                  </Box>
+                </div>
+
+                {/* Configuration (only visible when not playing) */}
+                {!isPlaying && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.AMBER}30` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 10 }}>⚙️ 设置下一轮 / Configure next round</div>
+
+                    {/* True state */}
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 11, color: C.TEXT2, marginBottom: 6 }}>True state (袋子真相)</div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn-press" onClick={() => setCascNextTrueState("silver")}
+                          style={{ flex: 1, padding: 10, fontSize: 12, fontWeight: 700, background: cascNextTrueState === "silver" ? "#C0C0C022" : "transparent", border: `1px solid ${cascNextTrueState === "silver" ? "#C0C0C080" : C.DIM + "30"}`, borderRadius: 8, color: cascNextTrueState === "silver" ? "#C0C0C0" : C.DIM, cursor: "pointer" }}>
+                          ⚪ 多数银色 Maj-Silver
+                        </button>
+                        <button className="btn-press" onClick={() => setCascNextTrueState("colored")}
+                          style={{ flex: 1, padding: 10, fontSize: 12, fontWeight: 700, background: cascNextTrueState === "colored" ? "#E74C3C22" : "transparent", border: `1px solid ${cascNextTrueState === "colored" ? "#E74C3C80" : C.DIM + "30"}`, borderRadius: 8, color: cascNextTrueState === "colored" ? "#E74C3C" : C.DIM, cursor: "pointer" }}>
+                          🔴 多数彩色 Maj-Colored
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Seed count slider */}
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 11, color: C.TEXT2, marginBottom: 4 }}>
+                        Seeded misleading signals: <strong style={{ color: C.AMBER }}>{cascNextSeedCount}</strong>
+                        <span style={{ color: C.DIM, fontWeight: 400, marginLeft: 6 }}>
+                          (first {cascNextSeedCount} student{cascNextSeedCount === 1 ? "" : "s"} see {minorityColor === "silver" ? "⚪ silver" : "🔴 colored"})
+                        </span>
+                      </div>
+                      <input type="range" min="0" max={Math.min(cascNextMaxPlayers, 5)} step="1" value={cascNextSeedCount}
+                        onChange={e => setCascNextSeedCount(parseInt(e.target.value))}
+                        style={{ width: "100%", accentColor: C.AMBER }} />
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.DIM }}>
+                        <span>0 (honest)</span>
+                        <span>{Math.min(cascNextMaxPlayers, 5)} (strong cascade)</span>
+                      </div>
+                    </div>
+
+                    {/* Max players */}
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 11, color: C.TEXT2, marginBottom: 4 }}>
+                        Max active players: <strong style={{ color: C.AMBER }}>{cascNextMaxPlayers}</strong>
+                      </div>
+                      <input type="range" min="3" max="15" step="1" value={cascNextMaxPlayers}
+                        onChange={e => setCascNextMaxPlayers(parseInt(e.target.value))}
+                        style={{ width: "100%", accentColor: C.AMBER }} />
+                    </div>
+
+                    {/* Show history toggle */}
+                    <div style={{ marginBottom: 12 }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 11, color: C.TEXT2 }}>
+                        <input type="checkbox" checked={cascNextShowHistory}
+                          onChange={e => setCascNextShowHistory(e.target.checked)} />
+                        Show prior announcements on students' phones
+                      </label>
+                      <div style={{ fontSize: 10, color: C.DIM, paddingLeft: 22 }}>
+                        If off, students must listen to the room to learn the public history.
+                      </div>
+                    </div>
+
+                    {/* Preview */}
+                    <div style={{ background: C.BG, borderRadius: 8, padding: 10, border: `1px dashed ${C.AMBER}30` }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: C.AMBER, marginBottom: 6 }}>📋 Preview signal sequence</div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                        {previewSeq.map((s, i) => (
+                          <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 6px", borderRadius: 5, background: s === "silver" ? "#C0C0C015" : "#E74C3C15", border: `1px solid ${s === "silver" ? "#C0C0C040" : "#E74C3C40"}`, fontSize: 10 }}>
+                            <span style={{ color: C.DIM, fontWeight: 700 }}>#{i + 1}</span>
+                            <span style={{ color: s === "silver" ? "#C0C0C0" : "#E74C3C" }}>{s === "silver" ? "银" : "彩"}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ fontSize: 10, color: C.DIM, marginTop: 6, fontStyle: "italic" }}>
+                        True state: {cascNextTrueState === "silver" ? "majority-silver (2 silver + 1 colored)" : "majority-colored (2 colored + 1 silver)"}.
+                        {" "}Each draw should match true state with prob ⅔.
+                      </div>
+                    </div>
+                  </Box>
+                )}
+
+                {/* Controls */}
+                <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                  {(cascPhase === "lobby" || cascPhase === "results") && (
+                    <button className="btn-press" onClick={() => cascStartRound((cascRound || 0) + 1)}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A2008, #1A1A05)`, border: `1px solid ${C.AMBER}50`, borderRadius: 12, color: C.AMBER, cursor: "pointer" }}>
+                      ▶️ {cascRound ? `开始第 ${cascRound + 1} 轮` : "开始第 1 轮"}
+                    </button>
+                  )}
+                  {isPlaying && (
+                    <button className="btn-press" onClick={cascEndRound}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A0F, #1A1008)`, border: `1px solid ${C.GOLD}50`, borderRadius: 12, color: C.GOLD, cursor: "pointer" }}>
+                      ⏹️ 结束 & 揭晓 End & Reveal
+                    </button>
+                  )}
+                  <button className="btn-press" onClick={cascResetGame}
+                    style={{ padding: 14, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                    🗑️
+                  </button>
+                </div>
+
+                {/* Live during play: who's up next, what to call out */}
+                {isPlaying && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.GREEN}30`, background: `${C.GREEN}08` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.GREEN, marginBottom: 8 }}>📣 现在叫 / Now call:</div>
+                    {nextToCall < currentSeq.length ? (
+                      <div style={{ fontSize: 28, fontWeight: 900, color: C.AMBER, textAlign: "center", letterSpacing: "0.05em" }}>
+                        Student #{nextToCall + 1}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 13, color: C.TEXT2, textAlign: "center", padding: 8 }}>
+                        All students have announced. Press "End & Reveal" to see results.
+                      </div>
+                    )}
+                  </Box>
+                )}
+
+                {/* Live announcement list (during play) */}
+                {(isPlaying || showResults) && currentSeq.length > 0 && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.DIM}30` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 8 }}>
+                      {showResults ? "🎬 Full Reveal" : "📢 Live announcements"}
+                    </div>
+                    <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr style={{ color: C.DIM, borderBottom: `1px solid ${C.DIM}30` }}>
+                          <th style={{ textAlign: "left", padding: 4 }}>#</th>
+                          {showResults && <th style={{ textAlign: "center", padding: 4 }}>Drew</th>}
+                          {!showResults && <th style={{ textAlign: "center", padding: 4 }}>Drew (hidden)</th>}
+                          <th style={{ textAlign: "center", padding: 4 }}>Said</th>
+                          <th style={{ textAlign: "left", padding: 4 }}>Name</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {currentSeq.map((s, i) => {
+                          const ann = sortedAnns.find(a => a.signalIndex === i);
+                          const drewColor = s === "silver" ? "#C0C0C0" : "#E74C3C";
+                          const saidColor = ann?.guess === "silver" ? "#C0C0C0" : "#E74C3C";
+                          const isCalled = i === nextToCall && isPlaying;
+                          const mm = ann && ann.signal !== ann.guess;
+                          return (
+                            <tr key={i} style={{ borderBottom: `1px solid ${C.DIM}15`, background: isCalled ? `${C.GREEN}10` : mm ? `${C.AMBER}10` : "transparent" }}>
+                              <td style={{ padding: 4, color: isCalled ? C.GREEN : C.TEXT2, fontWeight: 700 }}>
+                                {isCalled && "▶ "}{i + 1}
+                              </td>
+                              <td style={{ textAlign: "center", padding: 4, color: showResults ? drewColor : C.DIM, fontWeight: 600 }}>
+                                {showResults ? (s === "silver" ? "银" : "彩") : "···"}
+                              </td>
+                              <td style={{ textAlign: "center", padding: 4, color: ann ? saidColor : C.DIM, fontWeight: 600 }}>
+                                {ann ? (ann.guess === "silver" ? "银" : "彩") : "—"}
+                                {mm && " ⚡"}
+                              </td>
+                              <td style={{ padding: 4, color: ann ? C.TEXT : C.DIM, fontSize: 10 }}>{ann ? ann.name : "—"}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    {showResults && (
+                      <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.DIM}30`, fontSize: 11, color: C.TEXT2 }}>
+                        <div style={{ marginBottom: 4 }}>
+                          True state: <strong style={{ color: trueState === "silver" ? "#C0C0C0" : "#E74C3C" }}>{trueState === "silver" ? "Maj-Silver" : "Maj-Colored"}</strong>
+                        </div>
+                        <div style={{ marginBottom: 4 }}>
+                          Drew majority: <strong>{drewMaj}</strong>, Drew minority: <strong>{drewMin}</strong>
+                        </div>
+                        <div style={{ marginBottom: 4 }}>
+                          Said majority: <strong style={{ color: saidMaj > saidMin ? C.GREEN : C.RED }}>{saidMaj}</strong>, Said minority: <strong style={{ color: saidMin > saidMaj ? C.RED : C.TEXT }}>{saidMin}</strong>
+                        </div>
+                        <div style={{ marginTop: 6, fontSize: 11, color: mismatch > 0 ? C.AMBER : C.DIM, fontWeight: 600 }}>
+                          ⚡ {mismatch} student{mismatch === 1 ? "" : "s"} announced against their own signal (rational herding)
+                        </div>
+                      </div>
+                    )}
+                  </Box>
+                )}
+
+                {/* Pedagogical hint when no game is running yet */}
+                {cascPhase === "lobby" && (
+                  <Box style={{ marginBottom: 14, fontSize: 11, color: C.TEXT2, lineHeight: 1.7, background: `${C.AMBER}06`, border: `1px solid ${C.AMBER}20` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 6 }}>💡 Teaching tip</div>
+                    <p style={{ marginBottom: 4 }}>For a classic wrong cascade demo: set true state to <strong>majority-colored</strong>, seed count <strong>2</strong> (first two see silver), max players <strong>8</strong>.</p>
+                    <p>About 5 of 8 will draw colored (matching truth). Students 3+ face 2-silver public history and should rationally announce silver — locking in a wrong cascade.</p>
+                  </Box>
+                )}
               </div>
             );
           })()}
