@@ -1818,27 +1818,43 @@ function App() {
   // ================================================================
   // CASCADE — Teacher functions
   // ================================================================
-  // Generate a signal sequence given true state, seed count, seed color, max players.
-  // Seed signals are the first `seedCount` signals, all set to the "misleading" color
-  // (the one opposite to true state). The remaining signals match the true 2/3 vs 1/3
-  // distribution (i.e., majority color appears 2/3 of the time).
+  // Generate a signal sequence given true state, seed count, max players.
+  // The full sequence has ~2/3 majority signals and ~1/3 minority signals
+  // (consistent with drawing from a bag with majority:minority = 2:1).
+  // The first `seedCount` positions are filled with MINORITY-color signals,
+  // engineering an early "misleading" public history that can lock in a wrong cascade.
+  // The remaining minority signals are spread through the rest of the sequence.
   const cascGenerateSignalSequence = (trueState, seedCount, maxPlayers) => {
     const majorityColor = trueState; // "silver" or "colored"
     const minorityColor = trueState === "silver" ? "colored" : "silver";
+
+    // Total minority count: floor(maxPlayers / 3), matching p = 1/3.
+    // (Use floor so majority strictly exceeds minority for small N.)
+    const totalMinority = Math.floor(maxPlayers / 3);
+    // Cap seedCount at totalMinority — can't seed more minorities than exist.
+    const effectiveSeed = Math.min(seedCount, totalMinority);
+    const remainingMinority = totalMinority - effectiveSeed;
+    const remainingPositions = maxPlayers - effectiveSeed;
+
     const seq = [];
-    // Seed: misleading signals
-    for (let i = 0; i < seedCount && i < maxPlayers; i++) {
-      seq.push(minorityColor);
-    }
-    // Remainder: 2/3 majority, 1/3 minority. Use deterministic interleaving rather
-    // than random so teacher can preview exactly what will appear.
-    let remaining = maxPlayers - seedCount;
-    let cnt = 0;
-    while (seq.length < maxPlayers) {
-      // every 3rd one is the minority color
-      if (cnt % 3 === 2) seq.push(minorityColor);
-      else seq.push(majorityColor);
-      cnt++;
+    // Front-loaded seed: misleading signals
+    for (let i = 0; i < effectiveSeed; i++) seq.push(minorityColor);
+
+    // Distribute the remaining minority signals evenly across the remaining positions.
+    // For position k (0-indexed within the remainder), place a minority signal
+    // if the running expected count (k+1) * remainingMinority / remainingPositions
+    // crosses an integer boundary. This produces an even spread.
+    if (remainingPositions > 0) {
+      let placedMinority = 0;
+      for (let k = 0; k < remainingPositions; k++) {
+        const expected = (k + 1) * remainingMinority / remainingPositions;
+        if (placedMinority < Math.round(expected)) {
+          seq.push(minorityColor);
+          placedMinority++;
+        } else {
+          seq.push(majorityColor);
+        }
+      }
     }
     return seq;
   };
@@ -5091,12 +5107,12 @@ function App() {
                           (first {cascNextSeedCount} student{cascNextSeedCount === 1 ? "" : "s"} see {minorityColor === "silver" ? "⚪ silver" : "🔴 colored"})
                         </span>
                       </div>
-                      <input type="range" min="0" max={Math.min(cascNextMaxPlayers, 5)} step="1" value={cascNextSeedCount}
+                      <input type="range" min="0" max={Math.min(Math.floor(cascNextMaxPlayers / 3), 8)} step="1" value={cascNextSeedCount}
                         onChange={e => setCascNextSeedCount(parseInt(e.target.value))}
                         style={{ width: "100%", accentColor: C.AMBER }} />
                       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.DIM }}>
-                        <span>0 (honest)</span>
-                        <span>{Math.min(cascNextMaxPlayers, 5)} (strong cascade)</span>
+                        <span>0 (no seed)</span>
+                        <span>{Math.min(Math.floor(cascNextMaxPlayers / 3), 8)} (max cascade)</span>
                       </div>
                     </div>
 
@@ -5105,7 +5121,7 @@ function App() {
                       <div style={{ fontSize: 11, color: C.TEXT2, marginBottom: 4 }}>
                         Max active players: <strong style={{ color: C.AMBER }}>{cascNextMaxPlayers}</strong>
                       </div>
-                      <input type="range" min="3" max="15" step="1" value={cascNextMaxPlayers}
+                      <input type="range" min="3" max="40" step="1" value={cascNextMaxPlayers}
                         onChange={e => setCascNextMaxPlayers(parseInt(e.target.value))}
                         style={{ width: "100%", accentColor: C.AMBER }} />
                     </div>
@@ -5135,8 +5151,18 @@ function App() {
                       </div>
                       <div style={{ fontSize: 10, color: C.DIM, marginTop: 6, fontStyle: "italic" }}>
                         True state: {cascNextTrueState === "silver" ? "majority-silver (2 silver + 1 colored)" : "majority-colored (2 colored + 1 silver)"}.
-                        {" "}Each draw should match true state with prob ⅔.
+                        {" "}Each draw matches true state with prob ⅔.
                       </div>
+                      {(() => {
+                        const majCount = previewSeq.filter(s => s === cascNextTrueState).length;
+                        const minCount = previewSeq.length - majCount;
+                        const pct = previewSeq.length > 0 ? Math.round(majCount / previewSeq.length * 100) : 0;
+                        return (
+                          <div style={{ fontSize: 10, color: C.TEXT2, marginTop: 4 }}>
+                            Distribution: <strong style={{ color: cascNextTrueState === "silver" ? "#C0C0C0" : "#E74C3C" }}>{majCount}</strong> majority, <strong style={{ color: cascNextTrueState === "silver" ? "#E74C3C" : "#C0C0C0" }}>{minCount}</strong> minority ({pct}% majority)
+                          </div>
+                        );
+                      })()}
                     </div>
                   </Box>
                 )}
@@ -5183,6 +5209,7 @@ function App() {
                     <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 8 }}>
                       {showResults ? "🎬 Full Reveal" : "📢 Live announcements"}
                     </div>
+                    <div style={{ maxHeight: 400, overflowY: "auto" }}>
                     <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
                       <thead>
                         <tr style={{ color: C.DIM, borderBottom: `1px solid ${C.DIM}30` }}>
@@ -5218,6 +5245,7 @@ function App() {
                         })}
                       </tbody>
                     </table>
+                    </div>
                     {showResults && (
                       <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.DIM}30`, fontSize: 11, color: C.TEXT2 }}>
                         <div style={{ marginBottom: 4 }}>
@@ -5242,7 +5270,8 @@ function App() {
                   <Box style={{ marginBottom: 14, fontSize: 11, color: C.TEXT2, lineHeight: 1.7, background: `${C.AMBER}06`, border: `1px solid ${C.AMBER}20` }}>
                     <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 6 }}>💡 Teaching tip</div>
                     <p style={{ marginBottom: 4 }}>For a classic wrong cascade demo: set true state to <strong>majority-colored</strong>, seed count <strong>2</strong> (first two see silver), max players <strong>8</strong>.</p>
-                    <p>About 5 of 8 will draw colored (matching truth). Students 3+ face 2-silver public history and should rationally announce silver — locking in a wrong cascade.</p>
+                    <p>6 of 8 students will draw colored (consistent with truth, ~2/3 majority). Students 3+ face a 2-silver public history and should rationally announce silver — locking in a wrong cascade.</p>
+                    <p style={{ marginTop: 4 }}>For a larger class: try max players <strong>30</strong>, seed <strong>2</strong>. The cascade locks by ~student #4, so the reveal will show ~26 students announced against ~10 colored signals they drew but ignored.</p>
                   </Box>
                 )}
               </div>
