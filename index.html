@@ -334,6 +334,24 @@ function App() {
   const [cascNextMaxPlayers, setCascNextMaxPlayers] = useState(8);
   const [cascNextShowHistory, setCascNextShowHistory] = useState(true); // show prior announcements on students' phones
 
+  // ---- POKER (Ace-King-Queen Bluffing Poker, Week 14) ----
+  // Pairs of players (P1 vs P2). Each dealt one card from {A,K,Q}. P1 raises/folds; if raise, P2 calls/folds.
+  // Teaches bluffing as equilibrium behaviour under a signaling / PBE lens.
+  const [pokPhase, setPokPhase] = useState("lobby"); // "lobby" | "playing" | "results"
+  const [pokRound, setPokRound] = useState(0);
+  const [pokMyRole, setPokMyRole] = useState(null); // "P1" | "P2" | "sitout"
+  const [pokMyCard, setPokMyCard] = useState(null); // "A" | "K" | "Q"
+  const [pokTableId, setPokTableId] = useState(null); // which table I'm at this round
+  const [pokP1Action, setPokP1Action] = useState(null); // "R" | "F" — observed by P2 (the only signal)
+  const [pokMyAction, setPokMyAction] = useState(null); // my own submitted action
+  const [pokSubmitted, setPokSubmitted] = useState(false);
+  const [pokMyResult, setPokMyResult] = useState(null);
+  const [pokPlayerCount, setPokPlayerCount] = useState(0);
+  const [pokDoneCount, setPokDoneCount] = useState(0); // tables resolved
+  const [pokTableCount, setPokTableCount] = useState(0); // tables this round
+  const [pokRoundStats, setPokRoundStats] = useState(null);
+  const [pokAllStats, setPokAllStats] = useState([]);
+
   const game = GAMES[gameId];
   const myId = useRef(generateId());
   const nashId = useRef(() => {
@@ -383,6 +401,16 @@ function App() {
       let id = localStorage.getItem("gt_casc_id");
       if (!id) { id = generateId(); localStorage.setItem("gt_casc_id", id); }
       cascId.current = id;
+    } catch {}
+  }, []);
+
+  const pokId = useRef(generateId());
+  // Initialize persistent poker ID from localStorage
+  useEffect(() => {
+    try {
+      let id = localStorage.getItem("gt_pok_id");
+      if (!id) { id = generateId(); localStorage.setItem("gt_pok_id", id); }
+      pokId.current = id;
     } catch {}
   }, []);
 
@@ -1659,6 +1687,290 @@ function App() {
 
 
   // ================================================================
+  // POKER (Ace-King-Queen Bluffing Poker, Week 14) — constants
+  // ================================================================
+  // Three-card deck. Rank for comparison: A(3) > K(2) > Q(1).
+  const POK_RANK = { A: 3, K: 2, Q: 1 };
+  const POK_CARDS = ["A", "K", "Q"];
+
+  // Resolve a single table's payoffs (in chocolates, net of the 1-chip antes).
+  // Pot mechanics: both ante 1. P1 Raise = +1 from P1. P2 Call = +1 from P2.
+  // Payoffs are NET (what each player gains/loses on the round).
+  //   P1 Fold:                P1 = -1, P2 = +1
+  //   P1 Raise, P2 Fold:      P1 = +1, P2 = -1
+  //   P1 Raise, P2 Call:      showdown; higher card wins +2, loser -2
+  function pokResolveTable(p1Card, p2Card, p1Action, p2Action) {
+    if (p1Action === "F") return { p1: -1, p2: 1, outcome: "p1fold", showdown: false };
+    // P1 raised
+    if (p2Action === "f") return { p1: 1, p2: -1, outcome: "p2fold", showdown: false };
+    // P2 called → showdown
+    const p1Wins = POK_RANK[p1Card] > POK_RANK[p2Card];
+    return p1Wins
+      ? { p1: 2, p2: -2, outcome: "p1win", showdown: true }
+      : { p1: -2, p2: 2, outcome: "p2win", showdown: true };
+  }
+
+  // ================================================================
+  // POKER — Firebase listeners
+  // ================================================================
+  const pokListenersRef = useRef([]);
+
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const stateRef = db.ref("games/poker/state");
+    const onState = stateRef.on("value", (snap) => {
+      const s = snap.val();
+      if (!s) { setPokPhase("lobby"); setPokRound(0); return; }
+      setPokPhase(s.phase || "lobby");
+      setPokRound(s.round || 0);
+    });
+    pokListenersRef.current.push(() => stateRef.off("value", onState));
+
+    const playersRef = db.ref("games/poker/players");
+    const onPlayers = playersRef.on("value", (snap) => {
+      const p = snap.val() || {};
+      setPokPlayerCount(Object.keys(p).length);
+    });
+    pokListenersRef.current.push(() => playersRef.off("value", onPlayers));
+
+    return () => pokListenersRef.current.forEach(off => off());
+  }, [firebaseReady]);
+
+  // My assignment (role + card + table) when a round starts
+  useEffect(() => {
+    if (!firebaseReady || pokPhase !== "playing" || !pokRound) return;
+    const aRef = db.ref(`games/poker/rounds/${pokRound}/assign/${pokId.current}`);
+    aRef.once("value", (snap) => {
+      const a = snap.val();
+      if (a) {
+        setPokMyRole(a.role);
+        setPokMyCard(a.card);
+        setPokTableId(a.tableId != null ? String(a.tableId) : null);
+      } else {
+        setPokMyRole("sitout");
+      }
+    });
+  }, [firebaseReady, pokPhase, pokRound]);
+
+  // Live: watch my table so P2 can see P1's action; both can see resolution progress
+  useEffect(() => {
+    if (!firebaseReady || !pokRound || pokTableId == null || pokMyRole === "sitout") return;
+    const tRef = db.ref(`games/poker/rounds/${pokRound}/tables/${pokTableId}`);
+    const onTable = tRef.on("value", (snap) => {
+      const t = snap.val();
+      if (!t) return;
+      setPokP1Action(t.p1Action || null);
+    });
+    return () => tRef.off("value", onTable);
+  }, [firebaseReady, pokRound, pokTableId, pokMyRole]);
+
+  // Count resolved tables (host progress)
+  useEffect(() => {
+    if (!firebaseReady || !pokRound) return;
+    const tRef = db.ref(`games/poker/rounds/${pokRound}/tables`);
+    const onTables = tRef.on("value", (snap) => {
+      const tables = snap.val() || {};
+      const arr = Object.values(tables);
+      setPokTableCount(arr.length);
+      setPokDoneCount(arr.filter(t => {
+        if (t.p1Action === "F") return true;
+        if (t.p1Action === "R" && t.p2Action) return true;
+        return false;
+      }).length);
+    });
+    return () => tRef.off("value", onTables);
+  }, [firebaseReady, pokRound]);
+
+  // My result when phase = results
+  useEffect(() => {
+    if (!firebaseReady || pokPhase !== "results" || !pokRound) return;
+    const resRef = db.ref(`games/poker/rounds/${pokRound}/playerResults/${pokId.current}`);
+    resRef.once("value", (snap) => {
+      const r = snap.val();
+      if (r) setPokMyResult(r);
+    });
+    const statsRef = db.ref(`games/poker/rounds/${pokRound}/stats`);
+    statsRef.once("value", (snap) => {
+      const s = snap.val();
+      if (s) {
+        setPokRoundStats(s);
+        setPokAllStats(prev => {
+          const filtered = prev.filter(x => x.round !== pokRound);
+          return [...filtered, { round: pokRound, ...s }].sort((a, b) => a.round - b.round);
+        });
+      }
+    });
+  }, [firebaseReady, pokPhase, pokRound]);
+
+  // Reset per-round transient state when new round starts
+  useEffect(() => {
+    if (pokPhase === "playing") {
+      setPokSubmitted(false);
+      setPokMyAction(null);
+      setPokMyResult(null);
+      setPokRoundStats(null);
+      setPokP1Action(null);
+    }
+  }, [pokPhase, pokRound]);
+
+  const loadPokAllStats = async () => {
+    if (!firebaseReady) return;
+    const snap = await db.ref("games/poker/rounds").once("value");
+    const rounds = snap.val() || {};
+    const allStats = [];
+    for (const [rNum, rData] of Object.entries(rounds)) {
+      if (rData.stats) allStats.push({ round: parseInt(rNum), ...rData.stats });
+    }
+    setPokAllStats(allStats.sort((a, b) => a.round - b.round));
+  };
+
+  // ================================================================
+  // POKER — Player functions
+  // ================================================================
+  const joinPoker = async () => {
+    if (!firebaseReady) return;
+    const existSnap = await db.ref(`games/poker/players/${pokId.current}`).once("value");
+    if (existSnap.val()) { setScreen("pok_intro"); return; }
+    await db.ref(`games/poker/players/${pokId.current}`).set({
+      name: name || "匿名", studentId: studentId || "",
+      timestamp: firebase.database.ServerValue.TIMESTAMP,
+    });
+    setScreen("pok_intro");
+  };
+
+  // P1 submits Raise or Fold
+  const submitPokP1 = async (action) => {
+    if (!firebaseReady || !pokRound || pokTableId == null || pokSubmitted) return;
+    await db.ref(`games/poker/rounds/${pokRound}/tables/${pokTableId}/p1Action`).set(action);
+    setPokMyAction(action);
+    setPokSubmitted(true);
+  };
+
+  // P2 submits Call or Fold (only reached if P1 raised)
+  const submitPokP2 = async (action) => {
+    if (!firebaseReady || !pokRound || pokTableId == null || pokSubmitted) return;
+    await db.ref(`games/poker/rounds/${pokRound}/tables/${pokTableId}/p2Action`).set(action);
+    setPokMyAction(action);
+    setPokSubmitted(true);
+  };
+
+  // ================================================================
+  // POKER — Teacher functions
+  // ================================================================
+  const pokStartRound = async (roundNum) => {
+    if (!firebaseReady) return;
+    const playersSnap = await db.ref("games/poker/players").once("value");
+    const players = playersSnap.val() || {};
+    const playerIds = Object.keys(players);
+    if (playerIds.length < 2) { alert("至少需要 2 名玩家 / Need at least 2 players!"); return; }
+
+    // Shuffle players and pair them into tables of 2 (last one sits out if odd)
+    const shuffled = shuffle(playerIds);
+    const assign = {};
+    const tables = {};
+    let tableIdx = 0;
+    for (let i = 0; i + 1 < shuffled.length; i += 2) {
+      const p1 = shuffled[i], p2 = shuffled[i + 1];
+      // Deal two distinct cards from the 3-card deck
+      const deck = shuffle(POK_CARDS);
+      const c1 = deck[0], c2 = deck[1];
+      const tid = String(tableIdx);
+      tables[tid] = {
+        p1Id: p1, p2Id: p2, p1Card: c1, p2Card: c2,
+        p1Name: players[p1].name || "P1", p2Name: players[p2].name || "P2",
+        p1Action: null, p2Action: null,
+      };
+      assign[p1] = { role: "P1", card: c1, tableId: tableIdx };
+      assign[p2] = { role: "P2", card: c2, tableId: tableIdx };
+      tableIdx++;
+    }
+    if (shuffled.length % 2 === 1) {
+      assign[shuffled[shuffled.length - 1]] = { role: "sitout", card: null, tableId: null };
+    }
+
+    const updates = {};
+    updates[`games/poker/rounds/${roundNum}/tables`] = tables;
+    updates[`games/poker/rounds/${roundNum}/assign`] = assign;
+    updates[`games/poker/state`] = { round: roundNum, phase: "playing" };
+    await db.ref().update(updates);
+  };
+
+  const pokEndRound = async () => {
+    if (!firebaseReady || !pokRound) return;
+    const tSnap = await db.ref(`games/poker/rounds/${pokRound}/tables`).once("value");
+    const tables = tSnap.val();
+    if (!tables) { alert("没有牌桌 / No tables!"); return; }
+
+    const playerResults = {};
+    // Aggregates
+    let nTables = 0;
+    let p1RaiseCount = 0;          // how many P1s raised
+    let p2CallCount = 0, p2Faced = 0; // P2 call rate among those facing a raise
+    // Bluff tracking: P1 raised with the worst card (Q)
+    let qDealt = 0, qRaise = 0;     // among P1s holding Q, how many raised (bluff freq)
+    let aDealt = 0, aRaise = 0;     // among P1s holding A, how many raised (value freq)
+    let showdowns = 0;
+
+    for (const [tid, t] of Object.entries(tables)) {
+      // Default unresolved actions: if P1 never acted, treat as Fold; if P2 never acted after a raise, treat as Fold.
+      const p1Action = t.p1Action || "F";
+      const p2Action = t.p1Action === "R" ? (t.p2Action || "f") : null;
+      const res = pokResolveTable(t.p1Card, t.p2Card, p1Action, p2Action);
+      nTables++;
+      if (p1Action === "R") p1RaiseCount++;
+      if (t.p1Card === "Q") { qDealt++; if (p1Action === "R") qRaise++; }
+      if (t.p1Card === "A") { aDealt++; if (p1Action === "R") aRaise++; }
+      if (p1Action === "R") { p2Faced++; if (p2Action === "c") p2CallCount++; }
+      if (res.showdown) showdowns++;
+
+      const common = {
+        p1Card: t.p1Card, p2Card: t.p2Card, p1Action, p2Action,
+        outcome: res.outcome, showdown: res.showdown,
+        p1Name: t.p1Name, p2Name: t.p2Name,
+      };
+      playerResults[t.p1Id] = { ...common, role: "P1", myCard: t.p1Card, oppCard: t.p2Card, payoff: res.p1 };
+      playerResults[t.p2Id] = { ...common, role: "P2", myCard: t.p2Card, oppCard: t.p1Card, payoff: res.p2 };
+    }
+
+    const statsData = {
+      nTables,
+      p1RaiseRate: nTables ? Math.round(p1RaiseCount / nTables * 100) : 0,
+      p2CallRate: p2Faced ? Math.round(p2CallCount / p2Faced * 100) : null,
+      p2Faced,
+      bluffRate: qDealt ? Math.round(qRaise / qDealt * 100) : null, // P1 raising on Q
+      qDealt, qRaise,
+      valueRate: aDealt ? Math.round(aRaise / aDealt * 100) : null,  // P1 raising on A
+      aDealt, aRaise,
+      showdowns,
+    };
+
+    const updates = {};
+    updates[`games/poker/rounds/${pokRound}/playerResults`] = playerResults;
+    updates[`games/poker/rounds/${pokRound}/stats`] = statsData;
+    updates["games/poker/state/phase"] = "results";
+    await db.ref().update(updates);
+
+    await loadPokAllStats();
+    const bluffTxt = statsData.bluffRate != null ? `${statsData.bluffRate}% bluffed on Q` : "no Q dealt to P1";
+    alert(`✅ Round ${pokRound} resolved: ${nTables} tables, P1 raise ${statsData.p1RaiseRate}%, ${bluffTxt}`);
+  };
+
+  const pokResetGame = async () => {
+    if (!firebaseReady) return;
+    const pw = prompt("Type 'reset' to confirm (will clear all Poker data):");
+    if (pw !== "reset") return;
+    await db.ref("games/poker").remove();
+    setPokPhase("lobby"); setPokRound(0); setPokSubmitted(false);
+    setPokMyAction(null); setPokMyResult(null); setPokAllStats([]);
+    setPokMyRole(null); setPokMyCard(null); setPokTableId(null); setPokP1Action(null);
+    const newId = generateId();
+    pokId.current = newId;
+    try { localStorage.setItem("gt_pok_id", newId); } catch {}
+    alert("✅ 扑克游戏已重置 / Poker reset!");
+  };
+
+
+  // ================================================================
   // CASCADE — Firebase listeners
   // ================================================================
   const cascListenersRef = useRef([]);
@@ -2301,6 +2613,18 @@ function App() {
           <span style={{ fontSize: 18, marginRight: 8 }}>🍫</span>
           信息瀑布
           <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Information Cascade · Week 12</span>
+        </button>
+
+        {/* 9th game — Ace-King-Queen Poker (Bluffing / Signaling, Week 14) */}
+        <button className="btn-press" onClick={() => {
+          if (!name.trim() || !studentId.trim()) { alert("请填写姓名和学号"); return; }
+          joinPoker();
+        }}
+          style={{ width: "100%", padding: "14px 6px", fontSize: 13, fontWeight: 700, background: "linear-gradient(135deg, #1F0F2A, #120818)", border: `1px solid ${C.PURPLE}50`, borderRadius: 12, color: "white", cursor: "pointer", opacity: firebaseReady ? 1 : 0.4, boxShadow: `0 4px 20px ${C.PURPLE}25`, marginBottom: 12 }}
+          disabled={!firebaseReady}>
+          <span style={{ fontSize: 18, marginRight: 8 }}>🃏</span>
+          A-K-Q 扑克
+          <span style={{ fontSize: 10, opacity: 0.65, fontWeight: 400, marginLeft: 8 }}>Bluffing Poker · Week 14</span>
         </button>
 
         <div style={{ display: "flex", gap: 10 }}>
@@ -3922,6 +4246,353 @@ function App() {
   }
 
   // ================================================================
+  // POKER — Player screens
+  // ================================================================
+  if (screen === "pok_intro") {
+    const isPlaying = pokPhase === "playing" && pokRound > 0;
+    const isResults = pokPhase === "results" && pokRound > 0;
+
+    // Routing within an active round
+    if (isPlaying && pokMyRole === "P1") {
+      if (!pokSubmitted) return renderPokP1Play();
+      return renderPokWait();
+    }
+    if (isPlaying && pokMyRole === "P2") {
+      // P2 waits until P1 acts. If P1 folded, nothing for P2 to do → wait for reveal.
+      if (pokP1Action === "R" && !pokSubmitted) return renderPokP2Play();
+      return renderPokWait();
+    }
+    if (isPlaying && pokMyRole === "sitout") return renderPokSitout();
+    if (isResults && pokMyResult) return renderPokResult();
+    if (isResults && !pokMyResult) return renderPokWait();
+
+    // Lobby / waiting for round to start
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #120818)` }}>
+        <button className="btn-press" onClick={() => setScreen("home")} style={{ position: "fixed", top: 14, left: 14, background: "none", border: "none", color: C.TEXT2, fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 48, marginBottom: 8 }}>🃏</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>A-K-Q 扑克</h2>
+          <p style={{ fontSize: 13, color: C.PURPLE, marginBottom: 20 }}>Ace-King-Queen Bluffing Poker · Week 14</p>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", border: `1px solid ${C.PURPLE}30` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 10 }}>📋 规则 Rules</div>
+            <div style={{ fontSize: 12, color: C.TEXT, lineHeight: 1.7 }}>
+              <p style={{ marginBottom: 4 }}>• 你和对手各先投入 <strong>1 颗巧克力</strong> 到底池。每人发到一张牌：<strong style={{ color: C.GOLD }}>A &gt; K &gt; Q</strong>，只有自己能看到。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}>You and your opponent each ante <strong>1 chocolate</strong>. Each is dealt one card (<strong style={{ color: C.GOLD }}>A &gt; K &gt; Q</strong>), seen only by you.</p>
+
+              <p style={{ marginBottom: 4 }}>• <strong style={{ color: C.PURPLE }}>玩家 1</strong> 选择 <strong>加注 (R)</strong> 或 <strong>弃牌 (F)</strong>。加注 = 再投 1 颗；弃牌 = 结束，底池归玩家 2。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}><strong>Player 1</strong> chooses <strong>Raise (R)</strong> or <strong>Fold (F)</strong>. Raise = add 1 more; Fold = end, P2 takes the pot.</p>
+
+              <p style={{ marginBottom: 4 }}>• 若玩家 1 加注，<strong style={{ color: C.PURPLE }}>玩家 2</strong> 选择 <strong>跟注 (c)</strong> 或 <strong>弃牌 (f)</strong>。跟注 = 再投 1 颗后摊牌，大牌赢；弃牌 = 底池归玩家 1。</p>
+              <p style={{ marginBottom: 8, fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}>If P1 raises, <strong>Player 2</strong> chooses <strong>Call (c)</strong> or <strong>Fold (f)</strong>. Call = add 1, then showdown (higher card wins); Fold = P1 takes the pot.</p>
+
+              <p style={{ marginBottom: 4 }}>• <strong>收益 (净巧克力)</strong>：P1 弃牌 → P1 −1, P2 +1；P1 加注 + P2 弃牌 → P1 +1, P2 −1；摊牌 → 赢家 +2, 输家 −2。</p>
+              <p style={{ fontSize: 11, color: C.TEXT2, paddingLeft: 10 }}><strong>Net payoffs</strong>: P1 Fold → −1/+1; Raise+Fold → +1/−1; Showdown → winner +2, loser −2.</p>
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, textAlign: "left", background: `${C.PURPLE}0C`, border: `1px solid ${C.PURPLE}30` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 4 }}>🤔 想一想 Think</div>
+            <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+              <p style={{ marginBottom: 4 }}>拿到 Q (最差的牌) 时，你 (P1) 应该总是弃牌吗？如果对手知道「P1 只在拿好牌时加注」，加注就泄露了你的牌——所以有时<em>用 Q 诈唬</em>反而是最优的。你是 P2 时，又该多频繁跟注 K?</p>
+              <p style={{ color: C.DIM }}>With a Q (worst card), should P1 always fold? If P2 learns "P1 only raises with strength," a raise reveals your hand — so sometimes <em>bluffing with Q</em> is optimal. As P2, how often should you call with a K?</p>
+            </div>
+          </Box>
+
+          <div style={{ background: `${C.PURPLE}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.PURPLE}20` }}>
+            <div style={{ width: 40, height: 40, margin: "0 auto 8px", border: `3px solid ${C.DIM}30`, borderTopColor: C.PURPLE, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 13, color: C.TEXT2 }}>等待老师开始... Waiting for teacher to start...</div>
+            <div style={{ fontSize: 10, color: C.DIM, marginTop: 6 }}>已加入 Joined: {pokPlayerCount}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- POKER: a reusable card display ----
+  function PokCard({ card, big }) {
+    const red = card === "A" || card === "Q"; // purely cosmetic suit colouring
+    const sz = big ? { w: 88, h: 120, f: 52 } : { w: 56, h: 76, f: 30 };
+    return (
+      <div style={{ width: sz.w, height: sz.h, background: `linear-gradient(145deg, #FFFFFF, #E8E0F0)`, border: `2px solid ${C.PURPLE}80`, borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", fontSize: sz.f, fontWeight: 900, color: red ? "#B02050" : "#1A1A2A", boxShadow: `0 6px 20px ${C.PURPLE}40`, fontFamily: "Georgia, serif" }}>
+        {card}
+      </div>
+    );
+  }
+
+  // ---- POKER: P1 decision ----
+  function renderPokP1Play() {
+    const rank = POK_RANK[pokMyCard];
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #120818)` }}>
+        <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.PURPLE, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {pokRound} · 你是玩家 1 You are Player 1
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 14 }}>加注还是弃牌？Raise or Fold?</h2>
+
+          <Box style={{ marginBottom: 16, padding: 18, background: `${C.PURPLE}10`, border: `1px solid ${C.PURPLE}50` }}>
+            <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>你的牌 Your card (private)</div>
+            <div style={{ display: "flex", justifyContent: "center" }}><PokCard card={pokMyCard} big /></div>
+            <div style={{ fontSize: 11, color: C.DIM, marginTop: 10 }}>
+              {pokMyCard === "A" && "最强的牌 / The strongest card"}
+              {pokMyCard === "K" && "中间的牌 / The middle card"}
+              {pokMyCard === "Q" && "最弱的牌 / The weakest card"}
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, padding: 12, background: `${C.PURPLE}08`, border: `1px solid ${C.PURPLE}20`, textAlign: "left", fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+            <strong style={{ color: C.PURPLE }}>加注 R</strong>：再投 1 颗。对手随后决定跟注或弃牌。<br/>
+            <strong style={{ color: C.PURPLE }}>弃牌 F</strong>：放弃底池，输 1 颗给对手。
+          </Box>
+
+          <div style={{ display: "flex", gap: 12 }}>
+            <button className="btn-press" onClick={() => submitPokP1("R")}
+              style={{ flex: 1, padding: 18, fontSize: 17, fontWeight: 800, background: `linear-gradient(135deg, ${C.PURPLE}, #6A3D9E)`, border: "none", borderRadius: 14, color: "white", cursor: "pointer", boxShadow: `0 6px 24px ${C.PURPLE}40` }}>
+              ⬆️ 加注 Raise
+            </button>
+            <button className="btn-press" onClick={() => submitPokP1("F")}
+              style={{ flex: 1, padding: 18, fontSize: 17, fontWeight: 800, background: "transparent", border: `1px solid ${C.DIM}50`, borderRadius: 14, color: C.TEXT2, cursor: "pointer" }}>
+              🚫 弃牌 Fold
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- POKER: P2 decision (only if P1 raised) ----
+  function renderPokP2Play() {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #120818)` }}>
+        <div style={{ maxWidth: 420, width: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.PURPLE, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+            Round {pokRound} · 你是玩家 2 You are Player 2
+          </div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.TEXT, marginBottom: 6 }}>对手加注了！Opponent raised!</h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 16 }}>跟注摊牌，还是弃牌？Call for a showdown, or fold?</p>
+
+          <Box style={{ marginBottom: 14, padding: 14, background: `${C.PURPLE}10`, border: `1px solid ${C.PURPLE}50` }}>
+            <div style={{ fontSize: 10, color: C.DIM, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>你的牌 Your card (private)</div>
+            <div style={{ display: "flex", justifyContent: "center" }}><PokCard card={pokMyCard} big /></div>
+            <div style={{ fontSize: 11, color: C.DIM, marginTop: 10 }}>
+              {pokMyCard === "A" && "最强的牌 — 你一定赢摊牌 / Strongest — you win any showdown"}
+              {pokMyCard === "K" && "中间的牌 — 只输给 A / Middle — only loses to A"}
+              {pokMyCard === "Q" && "最弱的牌 — 摊牌必输 / Weakest — loses any showdown"}
+            </div>
+          </Box>
+
+          <Box style={{ marginBottom: 16, padding: 12, background: `${C.AMBER}0C`, border: `1px solid ${C.AMBER}30`, textAlign: "left", fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+            💭 对手加注了。他<em>可能</em>真有好牌……也可能在用 Q 诈唬。你信吗？<br/>
+            <span style={{ color: C.DIM }}>The raise could mean strength — or a bluff with Q. Do you believe it?</span>
+          </Box>
+
+          <div style={{ display: "flex", gap: 12 }}>
+            <button className="btn-press" onClick={() => submitPokP2("c")}
+              style={{ flex: 1, padding: 18, fontSize: 17, fontWeight: 800, background: `linear-gradient(135deg, ${C.PURPLE}, #6A3D9E)`, border: "none", borderRadius: 14, color: "white", cursor: "pointer", boxShadow: `0 6px 24px ${C.PURPLE}40` }}>
+              ✅ 跟注 Call
+            </button>
+            <button className="btn-press" onClick={() => submitPokP2("f")}
+              style={{ flex: 1, padding: 18, fontSize: 17, fontWeight: 800, background: "transparent", border: `1px solid ${C.DIM}50`, borderRadius: 14, color: C.TEXT2, cursor: "pointer" }}>
+              🚫 弃牌 Fold
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- POKER: waiting screen ----
+  function renderPokWait() {
+    const isP2WaitingForP1 = pokMyRole === "P2" && !pokP1Action && pokPhase === "playing";
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #120818)` }}>
+        <div style={{ textAlign: "center", maxWidth: 360 }}>
+          <div style={{ width: 50, height: 50, margin: "0 auto 16px", border: `3px solid ${C.DIM}30`, borderTopColor: C.PURPLE, borderRadius: "50%", animation: "spin 0.9s linear infinite" }} />
+          <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>
+            {isP2WaitingForP1 ? "等待玩家 1 行动..." : "已提交！等待本轮结束..."}
+          </h2>
+          <p style={{ fontSize: 12, color: C.DIM, marginBottom: 14 }}>
+            {isP2WaitingForP1 ? "Waiting for Player 1 to act" : "Submitted · Waiting for round to close"}
+          </p>
+          {pokMyCard && (
+            <div style={{ background: C.SURFACE, borderRadius: 12, padding: 14, border: `1px solid ${C.PURPLE}30`, marginBottom: 12, display: "flex", flexDirection: "column", alignItems: "center" }}>
+              <div style={{ fontSize: 10, color: C.DIM, marginBottom: 8 }}>你的牌 / Your card ({pokMyRole})</div>
+              <PokCard card={pokMyCard} />
+              {pokMyAction && (
+                <div style={{ fontSize: 12, color: C.PURPLE, marginTop: 10, fontWeight: 700 }}>
+                  你的选择 / You chose: {pokMyAction === "R" ? "加注 Raise" : pokMyAction === "F" ? "弃牌 Fold" : pokMyAction === "c" ? "跟注 Call" : "弃牌 Fold"}
+                </div>
+              )}
+              {pokMyRole === "P2" && pokP1Action === "F" && (
+                <div style={{ fontSize: 12, color: C.TEXT2, marginTop: 10 }}>对手弃牌了，你赢得底池！P1 folded — you win the pot.</div>
+              )}
+            </div>
+          )}
+          <Box style={{ textAlign: "center", padding: 10 }}>
+            <div style={{ fontSize: 10, color: C.DIM }}>已完成牌桌 / Tables resolved</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: C.PURPLE }}>{pokDoneCount} / {pokTableCount}</div>
+          </Box>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- POKER: sit-out screen (odd player) ----
+  function renderPokSitout() {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, background: `linear-gradient(165deg, ${C.BG}, #120818)` }}>
+        <div style={{ textAlign: "center", maxWidth: 340 }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }}>☕</div>
+          <h2 style={{ fontSize: 20, color: C.TEXT, marginBottom: 6 }}>本轮轮空 Sitting out</h2>
+          <p style={{ fontSize: 12, color: C.DIM }}>玩家人数为奇数，你这一轮轮空。下一轮会重新配对。</p>
+          <p style={{ fontSize: 11, color: C.DIM, marginTop: 6 }}>Odd number of players — you sit out this round and will be paired next round.</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- POKER: result ----
+  function renderPokResult() {
+    const r = pokMyResult;
+    if (!r) return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: `linear-gradient(165deg, ${C.BG}, #120818)` }}>
+        <div style={{ width: 40, height: 40, border: `3px solid ${C.DIM}30`, borderTopColor: C.PURPLE, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      </div>
+    );
+    const payoff = r.payoff;
+    const won = payoff > 0;
+    const stats = pokRoundStats;
+    const bgTint = won ? "#120A20" : payoff < 0 ? "#200B12" : "#0F0F1A";
+
+    // Human-readable line for what happened
+    let storyCN = "", storyEN = "";
+    if (r.outcome === "p1fold") { storyCN = "玩家 1 弃牌。玩家 2 赢得底池。"; storyEN = "P1 folded. P2 takes the pot."; }
+    else if (r.outcome === "p2fold") { storyCN = "玩家 1 加注，玩家 2 弃牌。玩家 1 赢得底池。"; storyEN = "P1 raised, P2 folded. P1 takes the pot."; }
+    else if (r.outcome === "p1win") { storyCN = "摊牌！玩家 1 的牌更大，赢得底池。"; storyEN = "Showdown! P1's card is higher — P1 wins."; }
+    else if (r.outcome === "p2win") { storyCN = "摊牌！玩家 2 的牌更大，赢得底池。"; storyEN = "Showdown! P2's card is higher — P2 wins."; }
+
+    // Was this a bluff? P1 raised on Q.
+    const wasBluff = r.p1Action === "R" && r.p1Card === "Q";
+    const bluffWorked = wasBluff && r.outcome === "p2fold";
+
+    return (
+      <div style={{ minHeight: "100vh", padding: 24, background: `linear-gradient(165deg, ${C.BG}, ${bgTint})`, overflowY: "auto" }}>
+        <div style={{ maxWidth: 440, margin: "0 auto", textAlign: "center" }}>
+          <div className="fade-up" style={{ fontSize: 48, marginBottom: 8 }}>
+            {won ? "🏆" : payoff < 0 ? "💸" : "🤝"}
+          </div>
+          <h2 className="fade-up fade-up-1" style={{ fontSize: 24, fontWeight: 800, color: C.TEXT, marginBottom: 4 }}>
+            {won ? "你赢了！You won!" : payoff < 0 ? "你输了 You lost" : "持平 Even"}
+          </h2>
+          <p className="fade-up fade-up-1" style={{ fontSize: 13, color: C.PURPLE, marginBottom: 18 }}>
+            Round {pokRound} · 你是 {r.role} You were {r.role}
+          </p>
+
+          {/* The showdown / reveal */}
+          <Box className="fade-up fade-up-2" style={{ marginBottom: 14, padding: 16, border: `1px solid ${C.PURPLE}30` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 12 }}>🃏 摊牌 The Cards</div>
+            <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 24 }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM, marginBottom: 6 }}>你 You ({r.role})</div>
+                <PokCard card={r.myCard} />
+              </div>
+              <div style={{ fontSize: 20, color: C.DIM }}>vs</div>
+              <div>
+                <div style={{ fontSize: 10, color: C.DIM, marginBottom: 6 }}>对手 Opp</div>
+                {/* Opponent card only revealed at showdown */}
+                {r.showdown
+                  ? <PokCard card={r.oppCard} />
+                  : <div style={{ width: 56, height: 76, background: `linear-gradient(145deg, ${C.SURFACE}, ${C.BG})`, border: `2px dashed ${C.DIM}50`, borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, color: C.DIM }}>?</div>}
+              </div>
+            </div>
+            <div style={{ fontSize: 12, color: C.TEXT, marginTop: 12, lineHeight: 1.6 }}>
+              {storyCN}<br/><span style={{ fontSize: 11, color: C.DIM }}>{storyEN}</span>
+            </div>
+            {!r.showdown && (
+              <div style={{ fontSize: 10, color: C.DIM, marginTop: 6, fontStyle: "italic" }}>
+                没有摊牌，对手的牌保持隐藏。No showdown — opponent's card stays hidden.
+              </div>
+            )}
+          </Box>
+
+          {/* Action trace */}
+          <Box className="fade-up fade-up-2" style={{ marginBottom: 14, padding: 14, textAlign: "left", border: `1px solid ${C.DIM}30` }}>
+            <div style={{ fontSize: 11, color: C.DIM, marginBottom: 6 }}>过程 / Sequence</div>
+            <div style={{ fontSize: 13, color: C.TEXT, fontFamily: "monospace" }}>
+              P1 ({r.p1Name}): <strong style={{ color: r.p1Action === "R" ? C.PURPLE : C.DIM }}>{r.p1Action === "R" ? "Raise ⬆️" : "Fold 🚫"}</strong>
+              {r.p1Action === "R" && (
+                <> → P2 ({r.p2Name}): <strong style={{ color: r.p2Action === "c" ? C.PURPLE : C.DIM }}>{r.p2Action === "c" ? "Call ✅" : "Fold 🚫"}</strong></>
+              )}
+            </div>
+          </Box>
+
+          {/* Bluff callout */}
+          {wasBluff && (
+            <Box className="fade-up fade-up-2" style={{ marginBottom: 14, padding: 14, background: `${C.AMBER}0C`, border: `1px solid ${C.AMBER}40`, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.AMBER, marginBottom: 4 }}>🎭 这是一次诈唬！A bluff!</div>
+              <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+                {r.role === "P1"
+                  ? (bluffWorked
+                      ? "你拿着最差的 Q 却加注，把对手吓跑了——诈唬成功！这正是均衡里 P1 偶尔该做的事。"
+                      : "你拿着 Q 诈唬，但对手跟注抓到了你。诈唬有风险——均衡要求只以一定概率诈唬。")
+                  : (bluffWorked
+                      ? "对手拿着 Q 诈唬，你弃牌了——被骗了。但别懊恼：面对加注，有时弃 K 是对的。"
+                      : "对手拿着 Q 诈唬，你跟注抓到了——漂亮！")}
+                <br/><span style={{ color: C.DIM }}>
+                  {r.role === "P1"
+                    ? (bluffWorked ? "You raised with the worst card (Q) and scared P2 off — the bluff worked." : "You bluffed with Q but got caught. Bluffing is risky — equilibrium mixes it in only sometimes.")
+                    : (bluffWorked ? "Opponent bluffed with Q and you folded. Don't beat yourself up — folding a K to a raise is sometimes correct." : "Opponent bluffed with Q and you called — nice catch!")}
+                </span>
+              </div>
+            </Box>
+          )}
+
+          {/* Payoff */}
+          <div className="fade-up fade-up-2" style={{ marginBottom: 16 }}>
+            <Box style={{ textAlign: "center", padding: 16 }}>
+              <div style={{ fontSize: 10, color: C.DIM }}>你的收益 (巧克力) Your payoff</div>
+              <div style={{ fontSize: 44, fontWeight: 800, color: payoff > 0 ? C.GREEN : payoff < 0 ? C.RED : C.DIM }}>
+                {payoff > 0 ? "+" : ""}{payoff}
+              </div>
+            </Box>
+          </div>
+
+          {/* Class stats */}
+          {stats && (
+            <Box className="fade-up fade-up-3" style={{ marginBottom: 14, padding: 14, textAlign: "left" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 10 }}>📊 班级数据 Class Data</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 11 }}>
+                <div style={{ background: `${C.PURPLE}10`, padding: 8, borderRadius: 8, border: `1px solid ${C.PURPLE}25` }}>
+                  <div style={{ color: C.PURPLE, fontWeight: 700, marginBottom: 4 }}>P1 加注率 Raise rate</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: C.TEXT }}>{stats.p1RaiseRate}%</div>
+                  <div style={{ color: C.DIM, fontSize: 10 }}>over {stats.nTables} tables</div>
+                </div>
+                <div style={{ background: `${C.AMBER}10`, padding: 8, borderRadius: 8, border: `1px solid ${C.AMBER}25` }}>
+                  <div style={{ color: C.AMBER, fontWeight: 700, marginBottom: 4 }}>🎭 用 Q 诈唬 Bluff on Q</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: C.TEXT }}>{stats.bluffRate != null ? stats.bluffRate + "%" : "—"}</div>
+                  <div style={{ color: C.DIM, fontSize: 10 }}>{stats.qRaise}/{stats.qDealt} P1s w/ Q raised</div>
+                </div>
+              </div>
+              {stats.p2CallRate != null && (
+                <div style={{ fontSize: 11, color: C.TEXT2, marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.DIM}20` }}>
+                  P2 面对加注的跟注率 / P2 call rate when facing a raise: <strong style={{ color: C.PURPLE }}>{stats.p2CallRate}%</strong> ({stats.p2Faced} faced)
+                </div>
+              )}
+            </Box>
+          )}
+
+          <div style={{ background: `${C.PURPLE}0C`, borderRadius: 10, padding: 12, border: `1px solid ${C.PURPLE}20` }}>
+            <div style={{ width: 30, height: 30, margin: "0 auto 8px", border: `2px solid ${C.DIM}30`, borderTopColor: C.PURPLE, borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+            <div style={{ fontSize: 12, color: C.TEXT2 }}>等待下一轮... Waiting for next round...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ================================================================
   // CASCADE — Player screens
   // ================================================================
   if (screen === "casc_intro") {
@@ -4217,8 +4888,8 @@ function App() {
 
           {/* Tab switcher */}
           <div style={{ display: "flex", gap: 4, marginBottom: 20, flexWrap: "wrap" }}>
-            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }, { id: "lemons", label: "🍋 柠檬" }, { id: "auction", label: "🎴 拍卖" }, { id: "cascade", label: "🍫 瀑布" }].map(t => (
-              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); if (t.id === "lemons") loadLemAllStats(); if (t.id === "auction") loadAuctAllStats(); }}
+            {[{ id: "grade", label: "📝 成绩" }, { id: "beauty", label: "🏆 选美" }, { id: "nash", label: "⚖️ 纳什" }, { id: "invest", label: "💰 投资" }, { id: "ultimatum", label: "🤝 通牒" }, { id: "lemons", label: "🍋 柠檬" }, { id: "auction", label: "🎴 拍卖" }, { id: "cascade", label: "🍫 瀑布" }, { id: "poker", label: "🃏 扑克" }].map(t => (
+              <button key={t.id} className="btn-press" onClick={() => { setTeacherTab(t.id); if (t.id === "grade") loadStats(); if (t.id === "nash") loadNashAllStats(); if (t.id === "invest") loadInvestAllResults(); if (t.id === "ultimatum") loadUltAllStats(); if (t.id === "lemons") loadLemAllStats(); if (t.id === "auction") loadAuctAllStats(); if (t.id === "poker") loadPokAllStats(); }}
                 style={{ flex: "1 1 70px", padding: "10px 4px", fontSize: 12, fontWeight: 700, background: teacherTab === t.id ? `${C.GOLD}20` : "transparent", border: teacherTab === t.id ? `1px solid ${C.GOLD}50` : `1px solid ${C.DIM}25`, borderRadius: 10, color: teacherTab === t.id ? C.GOLD : C.DIM, cursor: "pointer" }}>
                 {t.label}
               </button>
@@ -5274,6 +5945,155 @@ function App() {
                     <p style={{ marginTop: 4 }}>For a larger class: try max players <strong>30</strong>, seed <strong>2</strong>. The cascade locks by ~student #4, so the reveal will show ~26 students announced against ~10 colored signals they drew but ignored.</p>
                   </Box>
                 )}
+              </div>
+            );
+          })()}
+
+          {/* ---- POKER TAB ---- */}
+          {teacherTab === "poker" && (() => {
+            const latest = pokAllStats.length ? pokAllStats[pokAllStats.length - 1] : null;
+            // Cumulative bluff rate across rounds
+            let totQ = 0, totQR = 0, totA = 0, totAR = 0, totTables = 0, totRaise = 0;
+            pokAllStats.forEach(s => {
+              totQ += s.qDealt || 0; totQR += s.qRaise || 0;
+              totA += s.aDealt || 0; totAR += s.aRaise || 0;
+              totTables += s.nTables || 0; totRaise += Math.round((s.p1RaiseRate || 0) / 100 * (s.nTables || 0));
+            });
+            const cumBluff = totQ ? Math.round(totQR / totQ * 100) : null;
+            const cumValue = totA ? Math.round(totAR / totA * 100) : null;
+
+            return (
+              <div>
+                {/* Status */}
+                <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>状态 Status · R{pokRound || 0}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: pokPhase === "playing" ? C.GREEN : pokPhase === "results" ? C.GOLD : C.DIM, marginTop: 6 }}>
+                      {pokPhase === "playing" ? "进行中" : pokPhase === "results" ? "已揭晓" : "等待中"}
+                    </div>
+                  </Box>
+                  <Box style={{ flex: 1, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.DIM }}>玩家 Players</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: C.PURPLE, marginTop: 4 }}>{pokPlayerCount}</div>
+                    {pokPhase === "playing" && <div style={{ fontSize: 10, color: C.GREEN }}>完成: {pokDoneCount}/{pokTableCount}</div>}
+                  </Box>
+                </div>
+
+                {/* Controls */}
+                <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                  {(pokPhase === "lobby" || pokPhase === "results") && (
+                    <button className="btn-press" onClick={() => pokStartRound((pokRound || 0) + 1)}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #1F0F2A, #120818)`, border: `1px solid ${C.PURPLE}50`, borderRadius: 12, color: C.PURPLE, cursor: "pointer" }}>
+                      ▶️ {pokRound ? `开始第 ${pokRound + 1} 轮` : "开始第 1 轮 (配对发牌)"}
+                    </button>
+                  )}
+                  {pokPhase === "playing" && (
+                    <button className="btn-press" onClick={pokEndRound}
+                      style={{ flex: 1, padding: 14, fontSize: 14, fontWeight: 700, background: `linear-gradient(135deg, #2A1A0F, #1A1008)`, border: `1px solid ${C.GOLD}50`, borderRadius: 12, color: C.GOLD, cursor: "pointer" }}>
+                      ⏹️ 结束 & 结算 End & Resolve
+                    </button>
+                  )}
+                  <button className="btn-press" onClick={pokResetGame}
+                    style={{ padding: 14, fontSize: 13, background: "transparent", border: `1px solid ${C.RED}40`, borderRadius: 12, color: C.RED, cursor: "pointer" }}>
+                    🗑️
+                  </button>
+                </div>
+
+                {/* During play: live progress note */}
+                {pokPhase === "playing" && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.GREEN}30`, background: `${C.GREEN}08` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.GREEN, marginBottom: 6 }}>📣 进行中 / In progress</div>
+                    <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.6 }}>
+                      {pokTableCount} 桌已配对。等待各桌玩家行动 (P1 加注/弃牌 → P2 跟注/弃牌)。当 <strong style={{ color: C.GREEN }}>{pokDoneCount}/{pokTableCount}</strong> 完成后点击「结束 &amp; 结算」。
+                      <br/><span style={{ color: C.DIM }}>{pokTableCount} tables paired. Click "End &amp; Resolve" once tables are done — unfinished tables resolve as a fold.</span>
+                    </div>
+                  </Box>
+                )}
+
+                {/* Latest round summary */}
+                {latest && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.PURPLE}20` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 10 }}>
+                      🃏 第 {latest.round} 轮 / Round {latest.round} · {latest.nTables} 桌 tables
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, fontSize: 11 }}>
+                      <div style={{ background: `${C.PURPLE}10`, padding: 8, borderRadius: 8, textAlign: "center" }}>
+                        <div style={{ color: C.PURPLE, fontWeight: 700 }}>P1 Raise</div>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: C.TEXT }}>{latest.p1RaiseRate}%</div>
+                      </div>
+                      <div style={{ background: `${C.AMBER}10`, padding: 8, borderRadius: 8, textAlign: "center" }}>
+                        <div style={{ color: C.AMBER, fontWeight: 700 }}>🎭 Bluff (Q)</div>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: C.TEXT }}>{latest.bluffRate != null ? latest.bluffRate + "%" : "—"}</div>
+                        <div style={{ color: C.DIM, fontSize: 9 }}>{latest.qRaise}/{latest.qDealt}</div>
+                      </div>
+                      <div style={{ background: `${C.GREEN}10`, padding: 8, borderRadius: 8, textAlign: "center" }}>
+                        <div style={{ color: C.GREEN, fontWeight: 700 }}>P2 Call</div>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: C.TEXT }}>{latest.p2CallRate != null ? latest.p2CallRate + "%" : "—"}</div>
+                        <div style={{ color: C.DIM, fontSize: 9 }}>n={latest.p2Faced}</div>
+                      </div>
+                    </div>
+                  </Box>
+                )}
+
+                {/* Cumulative / equilibrium comparison */}
+                {pokAllStats.length > 0 && (
+                  <Box style={{ marginBottom: 14, border: `1px solid ${C.GOLD}25`, background: `${C.GOLD}06` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.GOLD, marginBottom: 8 }}>🎯 累计 vs 均衡 Cumulative vs Equilibrium</div>
+                    <div style={{ fontSize: 11, color: C.TEXT2, lineHeight: 1.8 }}>
+                      <div>班级用 Q 诈唬频率 / Class bluff freq (P1 raises on Q): <strong style={{ color: C.AMBER }}>{cumBluff != null ? cumBluff + "%" : "—"}</strong></div>
+                      <div>班级用 A 加注频率 / Class value-raise freq (P1 raises on A): <strong style={{ color: C.GREEN }}>{cumValue != null ? cumValue + "%" : "—"}</strong> <span style={{ color: C.DIM }}>(应接近 should ≈ 100%)</span></div>
+                    </div>
+                    <div style={{ fontSize: 10, color: C.DIM, marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.DIM}20`, lineHeight: 1.6 }}>
+                      在均衡里，P1 应该总用 A 加注 (价值)，并以一定概率用 Q 诈唬；P2 应以一定概率跟注 K 来惩罚诈唬。诈唬率为 0 说明班级还在「只用好牌加注」——可让 P2 思考此时该如何利用。
+                      <br/>In equilibrium P1 always raises the A (value) and raises the Q with positive probability (bluff); P2 calls a K with positive probability to punish bluffs. A 0% bluff rate means the class is still "only raising strong" — a cue to ask P2 how to exploit that.
+                    </div>
+                  </Box>
+                )}
+
+                {/* Round-by-round table */}
+                {pokAllStats.length > 0 && (
+                  <Box style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 11, color: C.DIM, marginBottom: 8 }}>各轮对比 / Round-by-round</div>
+                    <table style={{ width: "100%", fontSize: 10, borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.DIM }}>R</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.DIM }}>Tables</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.PURPLE }}>P1 Raise</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.AMBER }}>Bluff Q</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.GREEN }}>P2 Call</td>
+                          <td style={{ padding: 3, fontWeight: 700, color: C.GOLD }}>Showdowns</td>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pokAllStats.map((s, i) => (
+                          <tr key={i} style={{ borderTop: `1px solid ${C.DIM}15` }}>
+                            <td style={{ padding: 3, color: C.TEXT }}>{s.round}</td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.nTables}</td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.p1RaiseRate}%</td>
+                            <td style={{ padding: 3, color: C.AMBER }}>{s.bluffRate != null ? s.bluffRate + "%" : "—"} <span style={{ color: C.DIM }}>({s.qRaise}/{s.qDealt})</span></td>
+                            <td style={{ padding: 3, color: C.TEXT2 }}>{s.p2CallRate != null ? s.p2CallRate + "%" : "—"}</td>
+                            <td style={{ padding: 3, color: C.GOLD }}>{s.showdowns}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Box>
+                )}
+
+                {/* Teaching tip when idle */}
+                {pokPhase === "lobby" && pokAllStats.length === 0 && (
+                  <Box style={{ marginBottom: 14, fontSize: 11, color: C.TEXT2, lineHeight: 1.7, background: `${C.PURPLE}06`, border: `1px solid ${C.PURPLE}20` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.PURPLE, marginBottom: 6 }}>💡 Teaching tip</div>
+                    <p style={{ marginBottom: 4 }}>每轮自动把在场玩家两两配对成牌桌 (奇数则一人轮空)，从 A-K-Q 三张牌里给每桌发两张不同的牌。</p>
+                    <p style={{ marginBottom: 4 }}>Each round auto-pairs players into tables and deals 2 distinct cards from {"{A,K,Q}"}. P1 acts first; P2 only decides if P1 raised.</p>
+                    <p style={{ marginTop: 4 }}>建议玩 6–10 轮，观察「用 Q 诈唬率」是否随轮数上升——这是学生发现诈唬有利可图的时刻。Run 6–10 rounds and watch the bluff-on-Q rate climb as students discover bluffing pays.</p>
+                  </Box>
+                )}
+
+                <button className="btn-press" onClick={loadPokAllStats} style={{ width: "100%", padding: 10, fontSize: 12, background: "transparent", border: `1px solid ${C.DIM}30`, borderRadius: 10, color: C.TEXT2, cursor: "pointer", marginTop: 4 }}>
+                  🔄 刷新数据 Refresh
+                </button>
               </div>
             );
           })()}
